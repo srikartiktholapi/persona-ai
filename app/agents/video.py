@@ -140,3 +140,20 @@ def analyze_video(video_path):
         "head_stability": round(head_mean, 2),
         "body_language_score": round(body_score, 2)
     }
+'''import os
+import uuid
+import requests
+
+def download_video(video_url: str, save_dir="uploads"):
+    os.makedirs(save_dir, exist_ok=True)
+
+    video_id = str(uuid.uuid4())
+    video_path = os.path.join(save_dir, f"{video_id}.mp4")
+
+    with requests.get(video_url, stream=True, timeout=30) as r:
+        r.raise_for_status()
+        with open(video_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+'''
