@@ -1,21 +1,94 @@
-'''from app.orchestrator.state import AgentState
-
-def process(state: AgentState) -> dict:
-    """Pitch, pace, tone, pauses, confidence"""
-    return {}'''
+import librosa
+import numpy as np
 import os
 import tempfile
-import json
 from moviepy.editor import VideoFileClip
 from pydub import AudioSegment
 from sarvamai import SarvamAI
 import librosa
 import time
 import numpy as np
+import re
+from app.core.config import settings
+from app.orchestrator.state import AgentState
+
+def process(state: AgentState) -> dict:
+    """Live microphone frame mapping to Audio Performance Score"""
+    scores = state.get("scores", {})
+    features = state.get("recent_acoustic_features", [])
+    
+    if not features or "raw_audio" not in features[0]:
+        return {"scores": scores}
+        
+    audio_data, sample_rate = features[0]["raw_audio"]
+    
+    try:
+        # Convert av Audioframes to mono float32 for librosa
+        if audio_data.dtype == np.int16:
+            y = audio_data.mean(axis=0).astype(np.float32) / 32768.0
+        else:
+            y = audio_data.mean(axis=0).astype(np.float32)
+            
+        energy = librosa.feature.rms(y=y)[0]
+        avg_energy = float(np.mean(energy))
+        
+        pitches, magnitudes = librosa.piptrack(y=y, sr=sample_rate)
+        pitch_values = pitches[magnitudes > np.median(magnitudes)]
+        pitch_std = float(np.std(pitch_values)) if len(pitch_values) > 0 else 0
+        
+        # --- SNR estimation ---
+        # Use librosa split to find speech vs silence segments
+        try:
+            intervals = librosa.effects.split(y, top_db=25)
+            if len(intervals) > 0 and len(y) > 0:
+                speech_mask = np.zeros(len(y), dtype=bool)
+                for start, end in intervals:
+                    speech_mask[start:end] = True
+                
+                noise_samples = y[~speech_mask]
+                speech_samples = y[speech_mask]
+                
+                if len(noise_samples) > 100 and len(speech_samples) > 100:
+                    noise_power = float(np.mean(noise_samples ** 2)) + 1e-10
+                    speech_power = float(np.mean(speech_samples ** 2)) + 1e-10
+                    snr_db = 10 * np.log10(speech_power / noise_power)
+                else:
+                    snr_db = 20.0  # assume clean if not enough samples
+            else:
+                snr_db = 20.0
+        except Exception:
+            snr_db = 20.0
+        
+        scores["audio_snr_db"] = round(snr_db, 1)
+        
+        score = 3.0
+        if avg_energy > 0.02:
+            score += 3.5
+        if pitch_std > 20:
+            score += 3.5
+        
+        # --- Noise penalty ---
+        if snr_db < 5:
+            # Very noisy environment — significant penalty
+            score -= 2.0
+            scores["noise_detected"] = True
+        elif snr_db < 10:
+            # Moderate noise — small penalty
+            score -= 1.0
+            scores["noise_detected"] = True
+        else:
+            scores["noise_detected"] = False
+            
+        scores["audio_performance_score"] = round(max(1.0, min(10.0, score)), 2)
+    except Exception as e:
+        pass  # keep previous score if chunk is silent/corrupt
+        
+    return {"recent_acoustic_features": [], "scores": scores}
+
 
 def calculate_audio_metrics(transcript, duration_sec, silence_ratio=None):
 
-    import re
+ 
 
     words = transcript.split()
     word_count = len(words)
@@ -162,7 +235,7 @@ def process_audio(video_path, prefix, sarvam_key):
     total_audio_start = time.time()
 
     # -----------------------------
-    # 🎥 Extract audio
+    # Extract audio
     # -----------------------------
     start_extract = time.time()
 
@@ -173,6 +246,7 @@ def process_audio(video_path, prefix, sarvam_key):
 
     extract_time = round(time.time() - start_extract, 2)
 
+    sarvam_key = sarvam_key or settings.SARVAM_API_KEY
     client = SarvamAI(api_subscription_key=sarvam_key)
 
     def split_audio_to_chunks(audio_path, chunk_length_ms=29000):
@@ -195,7 +269,7 @@ def process_audio(video_path, prefix, sarvam_key):
         return chunks
 
     # -----------------------------
-    # 🎤 TRANSCRIPTION (Sarvam)
+    # TRANSCRIPTION (Sarvam)
     # -----------------------------
     start_transcription = time.time()
 
@@ -212,7 +286,7 @@ def process_audio(video_path, prefix, sarvam_key):
 
             resp = client.speech_to_text.translate(
                 file=f,
-                model="saaras:v2.5"
+                model=settings.SPEECH_TO_TEXT_MODEL
             )
 
             api_time = round(time.time() - start_api, 2)
@@ -234,7 +308,7 @@ def process_audio(video_path, prefix, sarvam_key):
     sarvam_total_time = round(sarvam_total_time, 2)
 
     # -----------------------------
-    # 🎧 SIGNAL ANALYSIS (librosa)
+    # SIGNAL ANALYSIS (librosa)
     # -----------------------------
     start_signal = time.time()
 
@@ -243,7 +317,7 @@ def process_audio(video_path, prefix, sarvam_key):
     signal_time = round(time.time() - start_signal, 2)
 
     # -----------------------------
-    # 📝 TEXT METRICS
+    #  TEXT METRICS
     # -----------------------------
     audio_metrics = calculate_audio_metrics(
     full_transcript,
@@ -252,7 +326,7 @@ def process_audio(video_path, prefix, sarvam_key):
 )
 
     # -----------------------------
-    # ⏱️ TOTAL AUDIO TIME
+    # TOTAL AUDIO TIME
     # -----------------------------
     total_audio_time = round(time.time() - total_audio_start, 2)
 

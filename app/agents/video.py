@@ -1,16 +1,55 @@
-'''from app.orchestrator.state import AgentState
-
-def process(state: AgentState) -> dict:
-    """Posture, gaze, gestures, facial engagement"""
-    return {}'''
+from app.orchestrator.state import AgentState
 import cv2
 import pandas as pd
 import mediapipe as mp
-import os
-import json
-import openai
+import cv2
+import pandas as pd
+import mediapipe as mp
 
 mp_holistic = mp.solutions.holistic
+
+def process(state: AgentState) -> dict:
+    """Live webcam frame mapping to Visual Performance Score"""
+    features = state.get("recent_video_features", [])
+    if not features or "raw_frames" not in features[0]:
+        return {}
+        
+    frames = features[0]["raw_frames"]
+    
+    posture_vals = []
+    expr_vals = []
+    eye_vals = []
+    
+    with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
+        for idx, frame in enumerate(frames):
+            if idx % 3 != 0:
+                continue
+            
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = holistic.process(rgb)
+            
+            if results.pose_landmarks:
+                posture_vals.append(calculate_posture_score(results.pose_landmarks.landmark))
+            
+            if results.face_landmarks:
+                expr_vals.append(calculate_expression_score(results.face_landmarks.landmark))
+                eye_vals.append(calculate_eye_contact(results.face_landmarks.landmark))
+
+    posture_mean = pd.Series(posture_vals).mean() if posture_vals else 5.0
+    expr_mean = pd.Series(expr_vals).mean() if expr_vals else 5.0
+    eye_mean = pd.Series(eye_vals).mean() if eye_vals else 5.0
+    
+    body_score = (0.4 * posture_mean) + (0.3 * eye_mean) + (0.3 * expr_mean)
+    
+    scores = state.get("scores", {})
+    scores["visual_performance_score"] = round(float(body_score), 2)
+    # Granular sub-scores for detailed feedback
+    scores["posture_score"] = round(float(posture_mean), 2)
+    scores["eye_contact_score"] = round(float(eye_mean), 2)
+    scores["expression_score"] = round(float(expr_mean), 2)
+    
+    # We dump raw_frames here to avoid saturating state history graph
+    return {"recent_video_features": [], "scores": scores}
 
 
 def calculate_posture_score(landmarks):
