@@ -31,10 +31,13 @@ def process(state: AgentState) -> dict:
     # --- Use Sarvam STT's language_code response as ground truth ---
     stt_langs = ts.get("stt_detected_languages", [])
     
-    # Always update scores with STT language detection
+    # Always update scores with STT language detection.
+    # IMPORTANT: Use a CUMULATIVE union so the list only grows — never resets mid-session.
     if stt_langs:
-        scores["all_detected_languages"] = stt_langs.copy()
-        non_eng = [l for l in stt_langs if l.lower() != "english"]
+        existing_langs = set(scores.get("all_detected_languages", []))
+        existing_langs.update(stt_langs)
+        scores["all_detected_languages"] = sorted(existing_langs)
+        non_eng = [l for l in scores["all_detected_languages"] if l.lower() != "english"]
         if non_eng:
             scores["detected_language_name"] = non_eng[-1]
             scores["regional_language_detected"] = True
@@ -66,7 +69,11 @@ def process(state: AgentState) -> dict:
             """
     
     # Score stays at 0.0 (not yet evaluated) until the first real evaluation completes.
-    if len(segment.split()) >= 5:
+    current_word_count = len(segment.split())
+    last_eval_word_count = scores.get("_text_last_eval_word_count", 0)
+    NEW_WORDS_THRESHOLD = 15  # Only re-evaluate when ≥15 new words arrived
+    
+    if current_word_count >= 5 and (current_word_count - last_eval_word_count) >= NEW_WORDS_THRESHOLD:
         try:
             prompt = f"""
             You are a professional grammar and language evaluator for interview transcripts.
@@ -150,6 +157,8 @@ def process(state: AgentState) -> dict:
                     scores["text_error_count"] = result["error_count"]
                 if "filler_count" in result:
                     scores["text_filler_count"] = result["filler_count"]
+                # Record word count at evaluation time for throttle gate
+                scores["_text_last_eval_word_count"] = current_word_count
             else:
                 logger.warning("Text evaluation API returned no choices. Response: %s", data)
         except Exception as e:

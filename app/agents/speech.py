@@ -20,10 +20,14 @@ _LANG_CODE_MAP = {
     "sat-IN": "Santali", "mni-IN": "Manipuri", "brx-IN": "Bodo",
     "mai-IN": "Maithili", "doi-IN": "Dogri",
 }
+# Reverse map: human-readable name → BCP-47 code (for STT hint)
+_NAME_TO_CODE = {name: code for code, name in _LANG_CODE_MAP.items()}
 
-# Thresholds for API-based language filtering (relaxed for multilingual speakers)
-_MIN_PERCENTAGE = 0.05  # Must be at least 5% of all detections
-_MIN_CONFIDENCE = 0.3   # Must have at least 0.3 max confidence
+# Tiered detection thresholds — faster for high-confidence, cautious for low-confidence
+_MIN_CONFIDENCE_FAST = 0.35   # 1 chunk is enough (Hindi, Telugu/Kannada, etc.)
+_MIN_CONFIDENCE_SLOW = 0.18   # 2 chunks needed  (Bengali ~0.20, borderline signals)
+_MIN_COUNT_FAST = 1
+_MIN_COUNT_SLOW = 2
 
 # Unicode script ranges for fallback detection from transcript text.
 _SCRIPT_RANGES = [
@@ -63,30 +67,29 @@ def _detect_languages_from_text(text: str) -> list[str]:
     if has_latin:
         result.append("English")
     for lang, count in sorted(script_char_counts.items(), key=lambda x: -x[1]):
-        if count >= 3:
+        if count >= 2:  # 2 chars minimum — catches single Bengali/Hindi words
             result.append(lang)
     return result
 
 
 def _filter_languages(lang_counts: dict, lang_max_prob: dict) -> list[str]:
-    """Apply percentage + confidence filtering to accumulated language detections.
+    """Tiered detection: faster for high-confidence, stricter for low-confidence.
 
-    Same logic as the batch pipeline in test_language_detection.py.
-    A language is confirmed only if:
-      - it accounts for >= 10% of total API detections
-      - its maximum confidence across chunks is >= 0.5
+    Tier 1 (fast)  : count >= 1 AND conf >= 0.35  → detected after just 1 STT chunk
+                     Catches Hindi, Telugu/Kannada, etc. within ~2s of being spoken.
+    Tier 2 (careful): count >= 2 AND conf >= 0.18  → needs 2 chunks
+                     Catches Bengali (~0.20 conf) while requiring repetition as signal.
+
+    No percentage gate — English dominates chunk counts in multi-language sessions,
+    making percentage-based gates too strict for 3-4 language scenarios.
     """
-    total = sum(lang_counts.values())
-    if total == 0:
-        return []
-
     confirmed = []
     for name, count in lang_counts.items():
-        pct = count / total
-        max_conf = lang_max_prob.get(name, 0.0)
-        if pct >= _MIN_PERCENTAGE and max_conf >= _MIN_CONFIDENCE:
+        conf = lang_max_prob.get(name, 0.0)
+        fast_pass = (count >= _MIN_COUNT_FAST and conf >= _MIN_CONFIDENCE_FAST)
+        slow_pass = (count >= _MIN_COUNT_SLOW and conf >= _MIN_CONFIDENCE_SLOW)
+        if fast_pass or slow_pass:
             confirmed.append(name)
-
     return confirmed
 
 
@@ -126,35 +129,145 @@ def process(state: AgentState) -> dict:
         sf.write(temp_path, y, sr)
 
         if settings.SARVAM_API_KEY:
+            import threading as _threading
             client = SarvamAI(api_subscription_key=settings.SARVAM_API_KEY)
+
+            # ── Always-on parallel probes for the 4 most commonly missed languages ─
+            # Strategy: call Sarvam with each specific language code simultaneously.
+            # When Bengali audio is sent with language_code="bn-IN", Sarvam transcribes
+            # in Bengali script. We then detect Bengali chars deterministically.
+            # We do NOT gate on language_probability (Sarvam often omits it for
+            # explicit language_code calls). The transcript itself is the signal.
+            #
+            # 4 probes + 1 primary = 5 parallel calls. All start at the same time,
+            # so total wait = time of slowest single call (no additional latency).
+            _ALWAYS_PROBE = [
+                ("bn-IN", "Bengali"),
+                ("te-IN", "Telugu"),
+                ("ta-IN", "Tamil"),
+                ("ml-IN", "Malayalam"),
+            ]
+            probe_results: list = [{} for _ in _ALWAYS_PROBE]
+
+            def _probe_call(path, code, name, out):
+                try:
+                    _c = SarvamAI(api_subscription_key=settings.SARVAM_API_KEY)
+                    with open(path, "rb") as _f:
+                        _r = _c.speech_to_text.transcribe(
+                            file=_f,
+                            model=settings.SPEECH_TO_TEXT_MODEL,
+                            language_code=code,
+                            mode="codemix",
+                        )
+                    out["name"]  = name
+                    out["code"]  = code
+                    out["text"]  = getattr(_r, "transcript", "") or ""
+                    out["prob"]  = float(getattr(_r, "language_probability", None) or 0.0)
+                    out["api_code"] = getattr(_r, "language_code", None)
+                except Exception as _ex:
+                    out["error"] = str(_ex)
+
+            probe_threads = []
+            for (code, name), out in zip(_ALWAYS_PROBE, probe_results):
+                t = _threading.Thread(
+                    target=_probe_call,
+                    args=(temp_path, code, name, out),
+                    daemon=True,
+                )
+                t.start()
+                probe_threads.append(t)
+
+            # ── Primary call: unknown / auto-detect (runs concurrently) ──────
             with open(temp_path, "rb") as f:
-                # Use Saaras V3 with codemix mode for correct multilingual transcription
                 resp = client.speech_to_text.transcribe(
                     file=f,
                     model=settings.SPEECH_TO_TEXT_MODEL,
-                    language_code=settings.SPEECH_LANGUAGE_CODE,
-                    mode="codemix"
+                    language_code=settings.SPEECH_LANGUAGE_CODE,   # "unknown"
+                    mode="codemix",
                 )
 
-            # Extract transcript text
-            text = resp.transcript if hasattr(resp, "transcript") else (resp.text if hasattr(resp, "text") else str(resp))
+            # Wait for all probes to finish
+            for t in probe_threads:
+                t.join(timeout=6.0)
+
+            # ── Merge probe results via TRANSCRIPT SCRIPT DETECTION ───────────
+            # This is deterministic: Bengali Unicode chars can ONLY come from Bengali.
+            # We do NOT rely on language_probability (often omitted for explicit codes).
+            for pr in probe_results:
+                if not pr or "text" not in pr:
+                    continue
+                probe_text  = pr.get("text", "")
+                probe_name  = pr.get("name", "")
+                script_hits = _detect_languages_from_text(probe_text)
+
+                # Primary signal: script chars in probe transcript
+                if probe_name in script_hits:
+                    lang_counts[probe_name]   = lang_counts.get(probe_name, 0) + 1
+                    if lang_max_prob.get(probe_name, 0.0) < 0.90:
+                        lang_max_prob[probe_name] = 0.90
+                    logger.info("Probe script-confirm: %s (transcript has %s chars)",
+                                probe_name, probe_name)
+
+                # Bonus signal: if API returned an explicit language code too
+                probe_api_name = _LANG_CODE_MAP.get(pr.get("api_code"), None)
+                if probe_api_name and probe_api_name not in ("unknown", probe_name):
+                    # The probe's API detected a DIFFERENT language than we probed →
+                    # that different language is also present
+                    lang_counts[probe_api_name]   = lang_counts.get(probe_api_name, 0) + 1
+                    lang_max_prob[probe_api_name] = max(
+                        lang_max_prob.get(probe_api_name, 0.0), pr.get("prob", 0.0)
+                    )
+
+                # Also run script detection on probe transcript for any other scripts
+                for slang in script_hits:
+                    if slang == "English" or slang == probe_name:
+                        continue
+                    lang_counts[slang] = lang_counts.get(slang, 0) + 1
+                    if lang_max_prob.get(slang, 0.0) < 0.90:
+                        lang_max_prob[slang] = 0.90
+
+            # ── Extract primary transcript ────────────────────────────────────
+            text = (getattr(resp, "transcript", None)
+                    or getattr(resp, "text", None)
+                    or str(resp))
             if text.strip():
                 rolling = (rolling + " " + text.strip()).strip()
 
-            # Extract API-level language detection (the reliable source)
-            api_lang_code = getattr(resp, "language_code", None)
-            api_probability = getattr(resp, "language_probability", None) or 0.0
-            api_lang_name = _LANG_CODE_MAP.get(api_lang_code, api_lang_code) if api_lang_code else None
+                # Script detection on primary transcript (0.90 confidence)
+                for slang in _detect_languages_from_text(text.strip()):
+                    if slang == "English":
+                        continue
+                    lang_counts[slang] = lang_counts.get(slang, 0) + 1
+                    if lang_max_prob.get(slang, 0.0) < 0.90:
+                        lang_max_prob[slang] = 0.90
 
+            # ── Primary API language code from unknown call ───────────────────
+            api_lang_code   = getattr(resp, "language_code", None)
+            api_probability = float(getattr(resp, "language_probability", None) or 0.0)
+            api_lang_name   = _LANG_CODE_MAP.get(api_lang_code, api_lang_code) if api_lang_code else None
             if api_lang_name and api_lang_name != "unknown":
-                lang_counts[api_lang_name] = lang_counts.get(api_lang_name, 0) + 1
+                lang_counts[api_lang_name]   = lang_counts.get(api_lang_name, 0) + 1
                 lang_max_prob[api_lang_name] = max(
                     lang_max_prob.get(api_lang_name, 0.0), api_probability
                 )
-                logger.info(
-                    "STT chunk language: %s (%s) conf=%.3f",
-                    api_lang_name, api_lang_code, api_probability
-                )
+                logger.info("Primary STT: %s conf=%.3f", api_lang_name, api_probability)
+
+            # ── Debug dump ───────────────────────────────────────────────────
+            try:
+                resp_dump = {
+                    k: str(getattr(resp, k))
+                    for k in dir(resp)
+                    if not k.startswith("_") and not callable(getattr(resp, k, None))
+                }
+                resp_dump["_probes"] = [
+                    {"lang": p.get("name"), "script_hits": _detect_languages_from_text(p.get("text",""))}
+                    for p in probe_results if "name" in p
+                ]
+            except Exception:
+                resp_dump = {"raw": str(resp)}
+            logger.error("SARVAM RAW RESPONSE: %s", resp_dump)
+            ts["last_sarvam_response"] = resp_dump
+            ts["last_transcript_chunk"] = text.strip() if text.strip() else ""
 
         os.remove(temp_path)
     except Exception as e:
