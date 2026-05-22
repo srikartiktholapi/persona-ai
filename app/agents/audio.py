@@ -1,8 +1,9 @@
-import librosa
+﻿import librosa
 import numpy as np
 import os
 import tempfile
-from moviepy.editor import VideoFileClip
+import subprocess
+import shutil
 from pydub import AudioSegment
 from sarvamai import SarvamAI
 import librosa
@@ -11,6 +12,81 @@ import numpy as np
 import re
 from app.core.config import settings
 from app.orchestrator.state import AgentState
+
+LANG_CODE_MAP = {
+    "hi-IN": "Hindi",
+    "bn-IN": "Bengali",
+    "kn-IN": "Kannada",
+    "ml-IN": "Malayalam",
+    "mr-IN": "Marathi",
+    "od-IN": "Odia",
+    "pa-IN": "Punjabi",
+    "ta-IN": "Tamil",
+    "te-IN": "Telugu",
+    "en-IN": "English",
+    "gu-IN": "Gujarati",
+    "as-IN": "Assamese",
+    "ur-IN": "Urdu",
+    "ne-IN": "Nepali",
+    "kok-IN": "Konkani",
+    "ks-IN": "Kashmiri",
+    "sd-IN": "Sindhi",
+    "sa-IN": "Sanskrit",
+    "sat-IN": "Santali",
+    "mni-IN": "Manipuri",
+    "brx-IN": "Bodo",
+    "mai-IN": "Maithili",
+    "doi-IN": "Dogri",
+}
+
+SCRIPT_RANGES = [
+    (0x0900, 0x097F, "Hindi"),
+    (0x0980, 0x09FF, "Bengali"),
+    (0x0A00, 0x0A7F, "Punjabi"),
+    (0x0A80, 0x0AFF, "Gujarati"),
+    (0x0B00, 0x0B7F, "Odia"),
+    (0x0B80, 0x0BFF, "Tamil"),
+    (0x0C00, 0x0C7F, "Telugu"),
+    (0x0C80, 0x0CFF, "Kannada"),
+    (0x0D00, 0x0D7F, "Malayalam"),
+]
+
+
+def _detect_languages_from_text(text: str) -> list[str]:
+    script_char_counts = {}
+    has_latin = False
+
+    for ch in text:
+        cp = ord(ch)
+        if (0x0041 <= cp <= 0x005A) or (0x0061 <= cp <= 0x007A):
+            has_latin = True
+            continue
+        for start, end, lang in SCRIPT_RANGES:
+            if start <= cp <= end:
+                script_char_counts[lang] = script_char_counts.get(lang, 0) + 1
+                break
+
+    detected = []
+    if has_latin:
+        detected.append("English")
+    detected.extend(
+        lang
+        for lang, count in sorted(script_char_counts.items(), key=lambda item: -item[1])
+        if count >= 2
+    )
+    return detected
+
+
+def _filter_languages(language_counts: dict, language_max_probability: dict) -> list[str]:
+    confirmed = []
+    for name, count in language_counts.items():
+        confidence = language_max_probability.get(name, 0.0)
+        fast_pass = count >= 1 and confidence >= 0.35
+        slow_pass = count >= 2 and confidence >= 0.18
+        script_pass = count >= 1 and confidence >= 0.90
+        if fast_pass or slow_pass or script_pass:
+            confirmed.append(name)
+    return sorted(confirmed)
 
 def process(state: AgentState) -> dict:
     """Live microphone frame mapping to Audio Performance Score"""
@@ -69,11 +145,11 @@ def process(state: AgentState) -> dict:
         
         # --- Noise penalty ---
         if snr_db < 5:
-            # Very noisy environment — significant penalty
+            # Very noisy environment â€” significant penalty
             score -= 2.0
             scores["noise_detected"] = True
         elif snr_db < 10:
-            # Moderate noise — small penalty
+            # Moderate noise â€” small penalty
             score -= 1.0
             scores["noise_detected"] = True
         else:
@@ -235,14 +311,58 @@ def process_audio(video_path, prefix, sarvam_key):
     total_audio_start = time.time()
 
     # -----------------------------
-    # Extract audio
+    # Extract audio via ffmpeg directly
+    # (MoviePy crashes on Chrome WebM files that have Duration:N/A)
     # -----------------------------
     start_extract = time.time()
 
-    with VideoFileClip(video_path) as video:
-        audio_file = f"uploads/{prefix}_audio.mp3"
-        video.audio.write_audiofile(audio_file, logger=None)
-        duration = video.duration
+    audio_file = os.path.join("uploads", f"{prefix}_audio.mp3")
+    os.makedirs(os.path.dirname(audio_file), exist_ok=True)
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        raise RuntimeError(
+            "FFmpeg is not available on PATH. Install FFmpeg or add its bin folder "
+            "to PATH, then restart Streamlit."
+        )
+
+    ffmpeg_cmd = [
+        ffmpeg_path, "-y",
+        "-i", video_path,
+        "-vn",                   # no video
+        "-acodec", "libmp3lame",
+        "-q:a", "2",            # VBR ~190 kbps - good quality
+        audio_file,
+    ]
+    try:
+        subprocess.run(
+            ffmpeg_cmd,
+            capture_output=True,       # suppress ffmpeg console noise
+            text=True,
+            check=True,                # raise on non-zero exit
+        )
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        last_line = stderr.splitlines()[-1] if stderr else "No FFmpeg stderr output."
+        raise RuntimeError(
+            f"FFmpeg audio extraction failed: {last_line}\n"
+            f"Command: {' '.join(ffmpeg_cmd)}"
+        ) from e
+
+    # Get duration from the re-encoded MP3 (always has proper metadata)
+    probe = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            audio_file,
+        ],
+        capture_output=True, text=True,
+    )
+    try:
+        duration = float(probe.stdout.strip())
+    except ValueError:
+        duration = 0.0
 
     extract_time = round(time.time() - start_extract, 2)
 
@@ -278,15 +398,19 @@ def process_audio(video_path, prefix, sarvam_key):
     final_text = []
     sarvam_total_time = 0
     chunk_times = []
+    language_counts = {}
+    language_max_probability = {}
 
     for i, chunk_path in enumerate(chunks):
         with open(chunk_path, "rb") as f:
 
             start_api = time.time()
 
-            resp = client.speech_to_text.translate(
+            resp = client.speech_to_text.transcribe(
                 file=f,
-                model=settings.SPEECH_TO_TEXT_MODEL
+                model=settings.SPEECH_TO_TEXT_MODEL,
+                language_code=settings.SPEECH_LANGUAGE_CODE,
+                mode="codemix",
             )
 
             api_time = round(time.time() - start_api, 2)
@@ -297,12 +421,33 @@ def process_audio(video_path, prefix, sarvam_key):
                 "time_sec": api_time
             })
 
-            text = resp.text if hasattr(resp, "text") else str(resp)
+            text = (
+                resp.transcript
+                if hasattr(resp, "transcript")
+                else resp.text if hasattr(resp, "text") else str(resp)
+            )
             final_text.append(text)
+
+            lang_code = getattr(resp, "language_code", None)
+            lang_name = LANG_CODE_MAP.get(lang_code, lang_code) if lang_code else None
+            probability = float(getattr(resp, "language_probability", None) or 0.0)
+            if lang_name and lang_name != "unknown":
+                language_counts[lang_name] = language_counts.get(lang_name, 0) + 1
+                language_max_probability[lang_name] = max(
+                    language_max_probability.get(lang_name, 0.0),
+                    probability,
+                )
+            for script_lang in _detect_languages_from_text(text):
+                language_counts[script_lang] = language_counts.get(script_lang, 0) + 1
+                language_max_probability[script_lang] = max(
+                    language_max_probability.get(script_lang, 0.0),
+                    0.90,
+                )
 
         os.remove(chunk_path)
 
     full_transcript = " ".join(final_text)
+    detected_languages = _filter_languages(language_counts, language_max_probability)
 
     transcription_time = round(time.time() - start_transcription, 2)
     sarvam_total_time = round(sarvam_total_time, 2)
@@ -332,6 +477,7 @@ def process_audio(video_path, prefix, sarvam_key):
 
     return {
         "full_transcript": full_transcript,
+        "detected_languages": detected_languages,
         "audio_metrics": audio_metrics,
         "audio_signal_analysis": audio_signal_metrics,
 

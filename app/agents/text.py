@@ -165,3 +165,103 @@ def process(state: AgentState) -> dict:
             logger.error("Text evaluation failed: %s", e)
             
     return {"scores": scores}
+
+
+def score_text(transcript: str, stt_langs: list, openai_key: str) -> dict:
+    """
+    Standalone batch version of the text-quality evaluator.
+    Runs the same LLM prompt as process() but accepts raw inputs
+    instead of an AgentState — suitable for the post-session pipeline.
+
+    Returns the raw JSON dict from the LLM (keys: text_score out of 10,
+    feedback, error_count, filler_count, detected_languages, etc.).
+    """
+    from app.core.config import settings
+
+    if not transcript or not transcript.strip():
+        return {"text_score out of 10": 5.0, "feedback": "No transcript available."}
+
+    lang_context = ""
+    if stt_langs:
+        lang_context = (
+            f"\nDETECTED LANGUAGES (from STT audio-level detection):\n"
+            f"The following languages have been detected: {', '.join(stt_langs)}.\n"
+            "Use this as the authoritative language list."
+        )
+
+    prompt = f"""
+You are a professional grammar and language evaluator for interview transcripts.
+Evaluate the following spoken transcript fragment fairly but firmly.
+
+IMPORTANT CONTEXT:
+- This transcript comes from a speech-to-text (STT) engine.
+- STT may introduce artifacts, mis-transcriptions, and incorrect script characters.
+- The candidate may speak in multiple languages — this is NORMAL for multilingual speakers.
+{lang_context}
+
+SCORING RUBRIC (out of 10):
+- 9-10: Near-flawless grammar and structure for spoken language. Very rare.
+- 7-8: Good grammar with minor slips. Professional and coherent.
+- 5-6: Acceptable grammar. Some errors and fillers, but meaning is clear.
+- 3-4: Noticeable grammar issues, heavy fillers, fragmented sentences.
+- 1-2: Severely broken, incoherent, or impossible to understand.
+
+DEDUCTIONS (apply moderately):
+- Clear grammar errors (not STT artifacts): -0.5 each
+- Excessive filler words (beyond 3 occurrences): -0.1 each
+- Severely incomplete or fragmented sentences: -0.5 each
+- Unprofessional or inappropriate language: -0.5 each
+
+IMPORTANT GUIDELINES:
+- Multilingual code-switching is NORMAL and should NOT be penalized.
+- Natural speech fillers (occasional "um", "uh") are expected in spoken language.
+- STT transcription errors should NOT count against the speaker.
+- The minimum score for intelligible, meaningful speech should be 3/10.
+
+Transcript:
+{transcript}
+
+Return ONLY JSON:
+{{
+    "text_score out of 10": <number 0-10>,
+    "is_regional_language": true/false,
+    "detected_languages": {json.dumps(stt_langs) if stt_langs else '["unknown"]'},
+    "error_count": <number of actual grammar errors found>,
+    "filler_count": <number of filler words found>,
+    "feedback": "short concise feedback listing specific issues found"
+}}
+"""
+
+    api_key   = openai_key or settings.OPENAI_API_KEY
+    api_url   = settings.OPENAI_API_URL
+    model     = settings.DEFAULT_MODEL_NAME
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a professional grammar evaluator for spoken language. "
+                    "You evaluate fairly, accounting for natural speech patterns and "
+                    "multilingual speakers. You never penalize code-switching."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    r = requests.post(api_url, headers=headers, json=payload, timeout=30.0)
+    data = r.json()
+
+    if "choices" in data:
+        return json.loads(data["choices"][0]["message"]["content"])
+
+    logger.warning("score_text: API returned no choices. Response: %s", data)
+    return {"text_score out of 10": 5.0, "feedback": "Evaluation unavailable."}

@@ -1,511 +1,767 @@
-import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
-import cv2
-import av
-import queue
+"""
+Persona AI — Record & Analyse Session
+======================================
+Architecture:
+  - Recorder opens in its OWN browser tab (localhost:8502) → full camera permissions
+  - JS MediaRecorder auto-POSTs blob to /upload on same server
+  - User returns to Streamlit tab, hits Analyse
+  - Full batch pipeline runs → scorecard
+"""
+
+import os
+import json
+import pathlib
+import tempfile
 import threading
-from app.orchestrator.graph import create_orchestrator
-
-st.set_page_config(layout="wide", page_title="Live Orchestrator Demo")
-
-# Custom Video Processor
-class VideoProcessor(VideoProcessorBase):
-    def __init__(self):
-        self.result_queue = queue.Queue()
-        self.frames = []
-        self.frame_count = 0
-
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img = frame.to_ndarray(format="bgr24")
-        
-        self.frames.append(img)
-        self.frame_count += 1
-        
-        # Dispatch to queue every 30 frames (approx 1-2 seconds)
-        if self.frame_count % 30 == 0:
-            self.result_queue.put(self.frames.copy())
-            self.frames.clear()
-            
-        return frame
-
-from streamlit_webrtc import AudioProcessorBase
-class AudioProcessor(AudioProcessorBase):
-    def __init__(self):
-        self.result_queue = queue.Queue()
-        self.audio_frames = []
-
-    def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
-        snd = frame.to_ndarray()
-        self.audio_frames.append(snd)
-        
-        # 60 frames ≈ 1.2s of audio — enough for Sarvam language ID, faster than 100-frame buffer
-        if len(self.audio_frames) > 60:
-            import numpy as np
-            audio_data = np.concatenate(self.audio_frames, axis=1)
-            self.result_queue.put((audio_data, frame.sample_rate))
-            self.audio_frames.clear()
-            
-        return frame
-
+import http.server
+import socketserver
+import streamlit as st
 from app.core.persona import persona_framework, performer_roles, target_roles
 
-# ── Persona & Prompt Configuration ────────────────────────────────────────────
-with st.expander("🎥 Session Setup — Persona & Prompt", expanded=True):
-    cfg_col1, cfg_col2 = st.columns(2)
+# ─────────────────────────────────────────────────────────────────────────────
+# Page config
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Persona AI — Session Analyser",
+    page_icon=None,
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-    with cfg_col1:
-        performer_names = [r.name for r in performer_roles]
-        selected_performer = st.selectbox(
-            " Performer Role (You)",
-            performer_names,
-            key="sel_performer",
-            help="Your role in this practice session."
-        )
-        performer_role_obj = persona_framework.get_role(selected_performer)
-        if performer_role_obj:
-            st.caption(f" {performer_role_obj.requirements['description']}")
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared paths
+# ─────────────────────────────────────────────────────────────────────────────
+RECORDER_PORT = 8502
+_RECORDER_DIR = pathlib.Path(tempfile.gettempdir()) / "persona_ai_recorder"
+_RECORDER_DIR.mkdir(parents=True, exist_ok=True)
+_UPLOAD_DIR   = pathlib.Path("uploads")
+_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+_READY_FILE   = _RECORDER_DIR / "latest.json"
 
-    with cfg_col2:
-        target_names = [r.name for r in target_roles]
-        selected_target = st.selectbox(
-            "👥 Target Audience (Customer)",
-            target_names,
-            key="sel_target",
-            help="The persona of the customer you are speaking to."
-        )
-        target_role_obj = persona_framework.get_role(selected_target)
-        if target_role_obj:
-            st.caption(f" {target_role_obj.requirements['description']}")
-            expectations = target_role_obj.requirements.get("expectations", [])
-            if expectations:
-                st.caption("Expectations: " + " • ".join(expectations))
+# ─────────────────────────────────────────────────────────────────────────────
+# Recorder HTML — full-page, opens in its own tab at localhost:8502
+# After Stop: auto-POSTs blob to /upload (same origin = no CORS)
+# ─────────────────────────────────────────────────────────────────────────────
+RECORDER_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Persona AI — Recorder</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:#eef4fb;font-family:'Inter',system-ui,sans-serif;color:#172033}
+body{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:24px}
 
-    # Default prompt hint based on target audience
-    _default_prompt = "Provide your query"
-    prompt_input = st.text_area(
-        "Your Prompt / Question",
-        value=_default_prompt,
-        height=80,
-        key="prompt_input",
-        help="Type the specific question or scenario the candidate must answer. "
-             "Relevance will be scored against this prompt AND the selected audience profile."
-    )
+.card{
+  width:100%;max-width:760px;
+  background:rgba(255,255,255,.94);
+  border:1px solid rgba(23,32,51,.1);
+  border-radius:20px;padding:28px;
+  display:flex;flex-direction:column;gap:18px;
+  box-shadow:0 24px 60px rgba(44,62,95,.16)
+}
 
-if 'orchestrator' not in st.session_state:
-    st.session_state.orchestrator = create_orchestrator()
-    st.session_state.state = {
-        "messages": [],
-        "metadata": {
-            "session_id": "live_streamlit",
-            "prompt": prompt_input,
-            "performer_role": selected_performer,
-            "target_role": selected_target,
-        },
-        "stream_status": {},
-        "transcript_state": {
-            "rolling_transcript": "",
-            "api_lang_counts": {},
-            "api_lang_max_prob": {},
-        },
-        "recent_video_features": [],
-        "recent_acoustic_features": [],
-        "recent_text_markers": [],
-        "scores": {
-            "visual_performance_score": 0.0,
-            "audio_performance_score": 0.0,
-            "text_performance_score": 0.0,
-            "relevance_score": 0.0,
-            "overall_score": 0.0
-        },
-        "active_alerts": [],
-        "cooldown_timers": {},
-        "report": {}
+.header{text-align:center}
+.logo{font-size:2rem;margin-bottom:6px}
+.title{font-size:1.4rem;font-weight:800;
+  background:linear-gradient(135deg,#4f8ef7,#8b5cf6);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.sub{font-size:.85rem;color:#60708a;margin-top:4px}
+
+.preview-wrap{
+  position:relative;border-radius:14px;overflow:hidden;
+  background:#dce7f3;border:2px solid rgba(23,32,51,.08);
+  aspect-ratio:16/9;width:100%
+}
+#preview,#playback{
+  width:100%;height:100%;object-fit:cover;
+  display:block;border-radius:12px
+}
+#playback{display:none}
+
+.badge{
+  position:absolute;top:12px;left:12px;
+  background:rgba(0,0,0,.65);padding:5px 12px;border-radius:999px;
+  font-size:11px;font-weight:700;letter-spacing:.07em;
+  display:none;align-items:center;gap:6px
+}
+.dot{width:9px;height:9px;background:#f43f5e;border-radius:50%;animation:blink 1s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.15}}
+
+.timer-badge{
+  position:absolute;top:12px;right:12px;
+  background:rgba(0,0,0,.55);padding:4px 12px;border-radius:999px;
+  font-size:13px;font-weight:700;font-variant-numeric:tabular-nums;display:none
+}
+
+.controls{display:flex;gap:12px}
+.btn{
+  flex:1;padding:14px 20px;border:none;border-radius:12px;
+  font-size:15px;font-weight:700;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;gap:8px;
+  transition:opacity .2s,transform .15s
+}
+.btn:hover:not(:disabled){opacity:.82;transform:translateY(-1px)}
+.btn:disabled{opacity:.3;cursor:not-allowed;transform:none}
+.btn-rec {background:linear-gradient(135deg,#2563eb,#7c3aed);color:#fff}
+.btn-stop{background:linear-gradient(135deg,#64748b,#475569);color:#fff}
+
+.prog-wrap{display:none;height:5px;border-radius:99px;background:rgba(23,32,51,.08);overflow:hidden}
+.prog-fill{height:100%;background:linear-gradient(90deg,#4f8ef7,#8b5cf6);width:0%;transition:width .3s}
+
+.status-box{
+  background:#f7faff;border:1px solid rgba(23,32,51,.08);
+  border-radius:12px;padding:13px 16px;font-size:13px;color:#60708a;
+  display:flex;align-items:flex-start;gap:10px;line-height:1.5;min-height:50px
+}
+.s-ico{font-size:18px;flex-shrink:0;margin-top:1px}
+
+.done-box{
+  display:none;background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);
+  border-radius:12px;padding:18px 20px;text-align:center
+}
+.done-box .done-title{font-size:1.05rem;font-weight:700;color:#10b981;margin-bottom:6px}
+.done-box .done-sub{font-size:.85rem;color:#60708a;line-height:1.6}
+.back-btn{
+  display:inline-block;margin-top:14px;padding:10px 24px;
+  background:linear-gradient(135deg,#4f8ef7,#8b5cf6);
+  color:#fff;border-radius:10px;font-weight:700;font-size:13px;
+  text-decoration:none;transition:opacity .2s
+}
+.back-btn:hover{opacity:.82}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="header">
+    <div class="logo">Persona AI</div>
+    <div class="title">Persona AI — Session Recorder</div>
+    <div class="sub">Record your session · it uploads automatically when you stop</div>
+  </div>
+
+  <div class="preview-wrap">
+    <video id="preview" autoplay muted playsinline></video>
+    <video id="playback" controls playsinline></video>
+    <div class="badge" id="badge"><div class="dot"></div>REC</div>
+    <div class="timer-badge" id="timerBadge">00:00</div>
+  </div>
+
+  <div class="controls">
+    <button class="btn btn-rec" id="btnRec" onclick="startRec()">Start Recording</button>
+    <button class="btn btn-stop" id="btnStop" onclick="stopRec()" disabled>Stop</button>
+  </div>
+
+  <div class="prog-wrap" id="progWrap">
+    <div class="prog-fill" id="progFill"></div>
+  </div>
+
+  <div class="status-box" id="statusBox">
+    <span class="s-ico"></span>
+    <span id="statusText">Click <strong>Start Recording</strong> — your camera and microphone will open.</span>
+  </div>
+
+  <div class="done-box" id="doneBox">
+    <div class="done-title">Recording uploaded successfully!</div>
+    <div class="done-sub">
+      Switch back to the <strong>Persona AI</strong> tab in your browser,<br>
+      click <strong>"I've finished recording"</strong> then hit <strong>"Analyse Session"</strong>.
+    </div>
+    <a class="back-btn" href="javascript:window.close()">Close this tab</a>
+  </div>
+</div>
+
+<script>
+let mr=null,chunks=[],stream=null,ivl=null,sec=0,durationAlertShown=false;
+
+const preview =document.getElementById('preview'),
+      playback=document.getElementById('playback'),
+      btnRec  =document.getElementById('btnRec'),
+      btnStop =document.getElementById('btnStop'),
+      badge   =document.getElementById('badge'),
+      timerEl =document.getElementById('timerBadge'),
+      progWrap=document.getElementById('progWrap'),
+      progFill=document.getElementById('progFill'),
+      statusEl=document.getElementById('statusText'),
+      statusBox=document.getElementById('statusBox'),
+      doneBox =document.getElementById('doneBox');
+
+function setStatus(ico,html){
+  statusBox.querySelector('.s-ico').textContent=ico;
+  statusEl.innerHTML=html;
+}
+function fmt(s){return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0')}
+
+async function startRec(){
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({video:true,audio:true});
+  }catch(e){
+    setStatus('','<strong>Camera access denied.</strong> Please allow camera &amp; microphone access in your browser and refresh.');
+    return;
+  }
+  preview.srcObject=stream;
+  playback.style.display='none';
+  preview.style.display='block';
+
+  const mime=
+    MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus') ? 'video/webm;codecs=vp9,opus' :
+    MediaRecorder.isTypeSupported('video/webm')                 ? 'video/webm' : 'video/mp4';
+
+  chunks=[];
+  mr=new MediaRecorder(stream,{mimeType:mime});
+  mr.ondataavailable=e=>{if(e.data&&e.data.size>0)chunks.push(e.data)};
+  mr.onstop=onStop;
+  mr.start(200);
+
+  btnRec.disabled=true; btnStop.disabled=false;
+  badge.style.display='flex'; timerEl.style.display='block';
+  sec=0; durationAlertShown=false; timerEl.textContent=fmt(sec);
+  ivl=setInterval(()=>{
+    sec++;
+    timerEl.textContent=fmt(sec);
+    if(sec>300 && !durationAlertShown){
+      durationAlertShown=true;
+      alert('You have crossed 5 minutes. Please keep the speech shorter.');
     }
-    # Background graph thread state
-    st.session_state.graph_result_queue = queue.Queue(maxsize=1)
-    st.session_state.graph_thread = None
+  },1000);
+  setStatus('','Recording… speak clearly and look at your camera.');
+}
 
-# Always sync latest prompt + persona into metadata (user may change mid-session)
-st.session_state.state["metadata"]["prompt"]             = prompt_input
-st.session_state.state["metadata"]["performer_role"]     = selected_performer
-st.session_state.state["metadata"]["target_role"]        = selected_target
+function stopRec(){
+  if(mr&&mr.state!=='inactive')mr.stop();
+  if(stream)stream.getTracks().forEach(t=>t.stop());
+  clearInterval(ivl);
+  badge.style.display='none'; timerEl.style.display='none';
+  btnStop.disabled=true; btnRec.disabled=true;
+  setStatus('','Finalising recording…');
+}
+
+async function onStop(){
+  const blob=new Blob(chunks,{type:mr.mimeType||'video/webm'});
+  playback.src=URL.createObjectURL(blob);
+  playback.style.display='block'; preview.style.display='none';
+
+  setStatus('','Uploading to Persona AI analyser…');
+  progWrap.style.display='block'; progFill.style.width='25%';
+
+  try{
+    const ext=(mr.mimeType||'').includes('mp4') ? '.mp4' : '.webm';
+    progFill.style.width='60%';
+    const res=await fetch('/upload',{
+      method:'POST',
+      headers:{'Content-Type':blob.type,'X-Ext':ext},
+      body:blob
+    });
+    progFill.style.width='100%';
+    if(res.ok){
+      statusBox.style.display='none';
+      doneBox.style.display='block';
+    }else{
+      setStatus('','Upload failed (HTTP '+res.status+'). Please try again.');
+      btnRec.disabled=false;
+    }
+  }catch(e){
+    setStatus('','Upload failed: '+e.message+'. Make sure Persona AI is running.');
+    btnRec.disabled=false;
+  }
+}
+</script>
+</body>
+</html>
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Background HTTP server — serves recorder page + receives uploaded recording
+# ─────────────────────────────────────────────────────────────────────────────
+_RECORDER_DIR.joinpath("index.html").write_text(RECORDER_HTML, encoding="utf-8")
 
 
-col1, col2 = st.columns([1, 1])
+class _RecorderHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_): pass
 
-with col1:
-    webrtc_ctx = webrtc_streamer(
-        key="live-webcam",
-        mode=WebRtcMode.SENDRECV,
-        video_processor_factory=VideoProcessor,
-        audio_processor_factory=AudioProcessor,
-        media_stream_constraints={"video": True, "audio": True},
-        async_processing=True,
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Ext")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.end_headers()
+
+    def do_GET(self):
+        data = (_RECORDER_DIR / "index.html").read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self):
+        if self.path != "/upload":
+            self.send_response(404); self.end_headers(); return
+        length  = int(self.headers.get("Content-Length", 0))
+        ext     = self.headers.get("X-Ext", ".webm")
+        payload = self.rfile.read(length)
+        fd, save_path = tempfile.mkstemp(suffix=ext, dir=str(_UPLOAD_DIR))
+        os.write(fd, payload); os.close(fd)
+        _READY_FILE.write_text(json.dumps({"path": save_path}), encoding="utf-8")
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+
+class _ReusingServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+
+def _start_server():
+    try:
+        with _ReusingServer(("127.0.0.1", RECORDER_PORT), _RecorderHandler) as s:
+            s.serve_forever()
+    except Exception:
+        pass
+
+
+if "recorder_server_started" not in st.session_state:
+    threading.Thread(target=_start_server, daemon=True).start()
+    st.session_state["recorder_server_started"] = True
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Custom CSS
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+:root{
+  --bg-primary:#eef4fb;--bg-card:rgba(255,255,255,.92);--bg-glass:rgba(255,255,255,.72);
+  --border:rgba(23,32,51,.1);--blue:#2563eb;--violet:#7c3aed;
+  --emerald:#059669;--amber:#d97706;--rose:#e11d48;--text:#172033;--muted:#60708a;
+}
+html,body,[class*="css"]{font-family:'Inter',sans-serif;background:var(--bg-primary);color:var(--text)}
+.stApp{background:linear-gradient(135deg,#eef4fb 0%,#f8fbff 48%,#edf1ff 100%);background-attachment:fixed}
+header[data-testid="stHeader"]{display:none}
+
+.hero{background:linear-gradient(135deg,#ffffff,#eef6ff 52%,#f3f0ff);border:1px solid var(--border);
+  border-radius:20px;padding:28px 36px;margin-bottom:22px;display:flex;align-items:center;gap:16px;
+  position:relative;overflow:hidden;box-shadow:0 16px 42px rgba(44,62,95,.11)}
+.hero::before{content:'';position:absolute;top:-60px;right:-60px;width:220px;height:220px;
+  background:radial-gradient(circle,rgba(37,99,235,.1) 0%,transparent 70%);pointer-events:none}
+.hero-icon{font-size:2.6rem}
+.hero-title{font-size:1.8rem;font-weight:800;margin:0;
+  background:linear-gradient(135deg,#4f8ef7,#8b5cf6);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.hero-sub{font-size:.88rem;color:var(--muted);margin:3px 0 0}
+
+.step-card{background:var(--bg-card);border:1px solid var(--border);border-radius:16px;
+  padding:20px 24px;margin-bottom:16px;backdrop-filter:blur(10px);box-shadow:0 10px 30px rgba(44,62,95,.08)}
+.step-label{font-size:.66rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--blue);margin-bottom:4px}
+.step-title{font-size:1.08rem;font-weight:700;color:var(--text)}
+
+.rec-launch{
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:16px;background:rgba(37,99,235,.06);border:2px dashed rgba(37,99,235,.24);
+  border-radius:16px;padding:36px 24px;text-align:center;margin:4px 0
+}
+.rec-btn-link{
+  display:inline-flex;align-items:center;gap:10px;
+  background:linear-gradient(135deg,#2563eb,#7c3aed);
+  color:#fff;padding:15px 36px;border-radius:12px;
+  font-size:1rem;font-weight:800;text-decoration:none;letter-spacing:.02em;
+  transition:opacity .2s,transform .15s;box-shadow:0 8px 24px rgba(37,99,235,.28)
+}
+.rec-btn-link:hover{opacity:.85;transform:translateY(-2px)}
+.rec-hint{font-size:.82rem;color:var(--muted);line-height:1.6;max-width:420px}
+
+.metric-card{background:var(--bg-glass);border:1px solid var(--border);border-radius:12px;
+  padding:18px 20px;text-align:center;transition:transform .2s,border-color .2s}
+.metric-card:hover{transform:translateY(-2px);border-color:rgba(37,99,235,.3)}
+.metric-value{font-size:2.2rem;font-weight:900;line-height:1;margin-bottom:4px}
+.metric-label{font-size:.74rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.05em}
+.score-great{color:#10b981}.score-good{color:#4f8ef7}.score-ok{color:#f59e0b}.score-poor{color:#f43f5e}
+
+.hr{height:1px;background:var(--border);margin:20px 0}
+.tag-pill{display:inline-block;padding:3px 10px;border-radius:999px;font-size:.7rem;font-weight:700;
+  letter-spacing:.05em;text-transform:uppercase}
+.tag-relevant{background:rgba(16,185,129,.15);color:#10b981}
+.tag-partial{background:rgba(245,158,11,.15);color:#f59e0b}
+.tag-irrelevant{background:rgba(244,63,94,.15);color:#f43f5e}
+
+.stTabs [role="tablist"]{background:var(--bg-glass);border-radius:12px;border:1px solid var(--border);padding:4px;gap:4px}
+.stTabs [role="tab"]{border-radius:8px !important;font-weight:600 !important;color:var(--muted) !important}
+.stTabs [role="tab"][aria-selected="true"]{background:linear-gradient(135deg,#4f8ef7,#8b5cf6) !important;color:#fff !important}
+[data-testid="stExpander"]{background:var(--bg-glass);border:1px solid var(--border) !important;border-radius:12px}
+.stMetric label{color:var(--muted) !important;font-weight:500 !important}
+.stMetric [data-testid="stMetricValue"]{color:var(--text) !important;font-weight:800 !important}
+button[kind="primary"]{background:linear-gradient(135deg,#4f8ef7,#8b5cf6) !important;border:none !important;
+  border-radius:10px !important;font-weight:700 !important}
+button[kind="primary"]:hover{opacity:.86 !important}
+button[kind="secondary"]{background:var(--bg-glass) !important;border-color:var(--border) !important;
+  color:var(--text) !important;border-radius:10px !important;font-weight:600 !important}
+.stSelectbox>div,.stTextArea>div{background:var(--bg-glass) !important;border-color:var(--border) !important;border-radius:10px !important}
+.stProgress>div>div>div{background:linear-gradient(90deg,#4f8ef7,#8b5cf6) !important;border-radius:99px}
+</style>
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hero
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""<div class="hero">
+  <div class="hero-icon">Persona AI</div>
+  <div>
+    <div class="hero-title">Persona AI — Session Analyser</div>
+    <div class="hero-sub">Record · Analyse · Improve — full AI scorecard in seconds</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def score_cls(v): return "score-great" if v>=8 else "score-good" if v>=6 else "score-ok" if v>=4 else "score-poor"
+def score_label(v): return "Strong" if v>=8 else "Good" if v>=6 else "Needs work" if v>=4 else "Low"
+def metric_card(col, label, value):
+    col.markdown(f"""<div class="metric-card">
+      <div class="metric-value {score_cls(value)}">{value}</div>
+      <div class="metric-label">{label}</div></div>""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 — Session Setup
+# ─────────────────────────────────────────────────────────────────────────────
+with st.expander("Step 1 — Session Setup (Persona & Prompt)", expanded=True):
+    c1, c2 = st.columns(2)
+    with c1:
+        selected_performer = st.selectbox("Performer Role (You)", [r.name for r in performer_roles], key="sel_p")
+        p_obj = persona_framework.get_role(selected_performer)
+        if p_obj: st.caption(f"{p_obj.requirements['description']}")
+    with c2:
+        selected_target = st.selectbox("Target Audience", [r.name for r in target_roles], key="sel_t")
+        t_obj = persona_framework.get_role(selected_target)
+        if t_obj:
+            st.caption(f"{t_obj.requirements['description']}")
+            exps = t_obj.requirements.get("expectations", [])
+            if exps: st.caption("Expects: "+ " • ".join(exps))
+    prompt_input = st.text_area(
+        "Prompt / Question",
+        value="Introduce yourself and explain the value you bring to the customer.",
+        height=72, key="prompt_input",
     )
 
-with col2:
-    st.subheader("Live Workflow Output")
-    
-    score_placeholder = st.empty()
-    lang_placeholder  = st.empty()   # live language badge bar
-    alert_placeholder = st.empty()
-    debug_placeholder = st.empty()
 
-if webrtc_ctx.state.playing:
-    if webrtc_ctx.video_processor:
-        
-        # Initialise background thread state on first render
-        if "graph_result_queue" not in st.session_state:
-            st.session_state.graph_result_queue = queue.Queue(maxsize=1)
-            st.session_state.graph_thread = None
-        if "last_known_languages" not in st.session_state:
-            st.session_state.last_known_languages = set()
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 — Record
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""<div class="step-card">
+  <div class="step-label">Step 2</div>
+  <div class="step-title"> Record Your Session</div>
+</div>""", unsafe_allow_html=True)
 
-        def _run_full_graph(orchestrator, state, result_q):
-            """Full graph (STT + text + relevance) — slow, runs in background."""
-            try:
-                new_state = orchestrator.invoke(state)
-                try:
-                    result_q.put_nowait(new_state)
-                except queue.Full:
-                    pass
-            except Exception:
-                pass
+st.markdown(f"""<div class="rec-launch">
+  <a class="rec-btn-link" href="http://localhost:{RECORDER_PORT}" target="_blank">
+    Open Recorder
+  </a>
+  <div class="rec-hint">
+    A <strong>full-screen recorder</strong> opens in a new tab — camera &amp; mic permissions work there.<br>
+    Record your session, hit <strong>Stop</strong>, then come back here and click below.
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
-        # ── Import video agent for the fast inline path ──────────────────────
-        from app.agents import video as _video_agent
+st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
-        # Loop to consume queue continuously while streaming
-        while True:
-            try:
-                # Wait for next video frame batch (fires every ~1s)
-                frames_chunk = webrtc_ctx.video_processor.result_queue.get(timeout=1.0)
 
-                audio_chunk = None
-                if webrtc_ctx.audio_processor:
-                    try:
-                        audio_chunk = webrtc_ctx.audio_processor.result_queue.get_nowait()
-                    except queue.Empty:
-                        pass
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 — Check status + Analyse
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""<div class="step-card">
+  <div class="step-label">Step 3</div>
+  <div class="step-title"> Analyse Session</div>
+</div>""", unsafe_allow_html=True)
 
-                # ── Pick up full-graph result if background thread finished ──
-                try:
-                    finished_state = st.session_state.graph_result_queue.get_nowait()
-                    # Merge: keep video scores from inline path, take rest from graph
-                    cur = st.session_state.state
-                    merged = dict(finished_state)
-                    merged_scores = dict(finished_state.get("scores", {}))
-                    # Preserve the freshest visual scores from inline processing
-                    for vk in ("visual_performance_score", "posture_score",
-                               "eye_contact_score", "expression_score"):
-                        if vk in cur.get("scores", {}):
-                            merged_scores[vk] = cur["scores"][vk]
-                    merged["scores"] = merged_scores
-                    st.session_state.state = merged
-                except queue.Empty:
-                    pass
+# Detect recording
+def _check_recording():
+    if not _READY_FILE.exists(): return False, None
+    try:
+        p = json.loads(_READY_FILE.read_text())["path"]
+        return os.path.isfile(p), p
+    except Exception:
+        return False, None
 
-                # ── FAST PATH: run video agent inline (MediaPipe, ~50-150ms) ──
-                try:
-                    vid_input = dict(st.session_state.state)
-                    vid_input["recent_video_features"] = [{"raw_frames": frames_chunk}]
-                    vid_result = _video_agent.process(vid_input)
-                    if vid_result:
-                        new_scores = dict(st.session_state.state.get("scores", {}))
-                        new_scores.update(vid_result.get("scores", {}))
-                        st.session_state.state["scores"] = new_scores
-                        if "active_alerts" in vid_result:
-                            st.session_state.state["active_alerts"] = vid_result["active_alerts"]
-                except Exception:
-                    pass  # video errors never block the UI
+recording_ready, recording_path = _check_recording()
 
-                # ── SLOW PATH: full graph only when new audio is available ────
-                thread = st.session_state.graph_thread
-                if audio_chunk and (thread is None or not thread.is_alive()):
-                    next_state = dict(st.session_state.state)
-                    next_state["metadata"] = dict(next_state.get("metadata", {}))
-                    next_state["metadata"]["prompt"] = prompt_input
-                    next_state["recent_video_features"] = [{"raw_frames": frames_chunk}]
-                    next_state["recent_acoustic_features"] = [{"raw_audio": audio_chunk}]
+col_refresh, col_analyse = st.columns([1, 3])
+with col_refresh:
+    if st.button("Recording Ready", key="btn_refresh", use_container_width=True):
+        st.rerun()
 
-                    t = threading.Thread(
-                        target=_run_full_graph,
-                        args=(st.session_state.orchestrator, next_state,
-                              st.session_state.graph_result_queue),
-                        daemon=True,
-                    )
-                    t.start()
-                    st.session_state.graph_thread = t
+with col_analyse:
+    analyse_clicked = st.button(
+        "Analyse Session",
+        type="primary",
+        disabled=not recording_ready,
+        use_container_width=True,
+        key="btn_analyse",
+    )
 
-                # ── Render immediately from last known state (no blocking) ──
-
-                state = st.session_state.state
-
-                with score_placeholder.container():
-                    sc = state["scores"].get("overall_score", 0)
-                    st.metric("Overall Score Tracking", f"{sc} / 10")
-
-                # ── Language badge bar (fires toast on new detection) ─────────
-                _ts   = state.get("transcript_state", {})
-                _langs = _ts.get("stt_detected_languages", [])
-                _new  = [l for l in _langs
-                         if l not in st.session_state.last_known_languages]
-                for _nl in _new:
-                    st.toast(f"🌐 {_nl} detected!", icon="🌐")
-                    st.session_state.last_known_languages.add(_nl)
-
-                with lang_placeholder.container():
-                    if _langs:
-                        _LANG_FLAGS = {
-                            "English": "🇬🇧", "Hindi": "🇮🇳",
-                            "Bengali": "🇧🇩", "Tamil": "🇮🇳",
-                            "Telugu": "🇮🇳", "Kannada": "🇮🇳",
-                            "Malayalam": "🇮🇳", "Gujarati": "🇮🇳",
-                            "Punjabi": "🇮🇳", "Marathi": "🇮🇳",
-                            "Odia": "🇮🇳", "Urdu": "🇵🇰",
-                        }
-                        badges = " • ".join(
-                            f"{_LANG_FLAGS.get(l, '🗺️')} **{l}**" for l in _langs
-                        )
-                        st.markdown(f"🌐 **Languages detected:** {badges}")
-                    else:
-                        st.caption("🌐 Listening for languages…")
-
-                with alert_placeholder.container():
-                    alerts = state.get("active_alerts", [])
-                    if alerts:
-                        for a in alerts:
-                            level = a.get("level", "info")
-                            msg = a["message"]
-                            if level == "success":
-                                st.success(msg)
-                            elif level == "warning":
-                                st.warning(msg)
-                            else:
-                                st.info(msg)
-                    else:
-                        st.info(" Performance looks solid — keep going!")
-
-                with debug_placeholder.container():
-                    with st.expander("Internal Scores Buffer"):
-                        st.json(state["scores"])
-                    with st.expander("Language Detection (API)"):
-                        ts = state.get("transcript_state", {})
-                        confirmed_langs = ts.get("stt_detected_languages", [])
-                        raw_counts = ts.get("api_lang_counts", {})
-                        raw_conf = ts.get("api_lang_max_prob", {})
-                        
-                        st.markdown("**Detected Languages:**")
-                        st.json(confirmed_langs)
-                        
-                        st.markdown("**API Counts:**")
-                        st.json(raw_counts)
-                        
-                        st.markdown("**API Max Confidence:**")
-                        st.json(raw_conf)
-                        
-                        if confirmed_langs:
-                            st.success(f"Languages detected: {', '.join(confirmed_langs)}")
-                        else:
-                            st.warning("No languages confirmed yet. Please speak clearly.")
-                        
-                        filtered_out = [
-                            f"{lang} (conf={raw_conf.get(lang, 0):.2f}, "
-                            f"pct={raw_counts.get(lang,0)/max(sum(raw_counts.values()),1)*100:.0f}%, "
-                            f"count={raw_counts.get(lang,0)})"
-                            for lang in raw_counts
-                            if lang not in confirmed_langs
-                        ]
-                        if filtered_out:
-                            st.caption(
-                                f"⚠️ Filtered out (need count≥2, ≥5%, conf≥0.15): "
-                                f"{', '.join(filtered_out)}"
-                            )
-                    
-                    with st.expander("🔬 Sarvam Raw Response (last chunk)"):
-                        ts = state.get("transcript_state", {})
-                        last_chunk = ts.get("last_transcript_chunk", "")
-                        last_resp  = ts.get("last_sarvam_response", {})
-                        
-                        st.markdown(f"**Last transcript chunk:** `{last_chunk}`")
-                        st.markdown("**Raw API response fields:**")
-                        
-                        # Highlight the key language fields prominently
-                        lang_code = last_resp.get("language_code", "⚠️ NOT FOUND")
-                        lang_prob  = last_resp.get("language_probability", "⚠️ NOT FOUND")
-                        st.error(f"language_code → **{lang_code}**")
-                        st.error(f"language_probability → **{lang_prob}**")
-                        
-                        # Show all other fields
-                        st.json(last_resp)
-                    
-
-            except queue.Empty:
-                pass
+if recording_ready:
+    st.success("Recording received and ready! Hit **Analyse Session** to get your scorecard.")
 else:
-    scores = st.session_state.state.get("scores", {})
-    if scores.get("overall_score", 0) > 0:
-        st.markdown("---")
-        st.subheader("Session Summary")
-        st.success("Your session has concluded. Here is your final scorecard:")
-        
-        sc1, sc2, sc3 = st.columns(3)
-        sc1.metric("Final Overall Score", f"{scores.get('overall_score', 0)} / 10")
-        sc2.metric("Visual Performance", f"{scores.get('visual_performance_score', 0)} / 10")
-        sc3.metric("Audio Performance", f"{scores.get('audio_performance_score', 0)} / 10")
-        
-        sc4, sc5 = st.columns(2)
-        sc4.metric("Text Quality & Grammar", f"{scores.get('text_performance_score', 0)} / 10")
-        sc5.metric("Prompt Relevance", f"{scores.get('relevance_score', 0)} / 10")
-        
-        langs_used = scores.get('all_detected_languages', ['English'])
-        st.info(f"** Languages Spoken Profile:** {', '.join(langs_used)}")
-        
-        st.markdown("### Key Takeaways")
-        
-        from app.core.persona import persona_framework
-        
-        # Fetch selected roles and category from session state metadata
-        meta = st.session_state.state.get("metadata", {})
-        performer_role_name = meta.get("performer_role", None)
-        target_role_name = meta.get("target_role", None)
-        practice_category = meta.get("practice_category", None)
-        
-        performer_role = persona_framework.get_role(performer_role_name) if performer_role_name else None
-        target_role = persona_framework.get_role(target_role_name) if target_role_name else None
-        
-        # Contextual feedback messages
-        if performer_role and target_role:
-            st.markdown(f"**Performer Role:** {performer_role.name} - {performer_role.requirements['description']}")
-            st.markdown(f"**Target Audience:** {target_role.name} - {target_role.requirements['description']}")
-        
-        if practice_category:
-            st.markdown(f"**Practice Session Category:** {practice_category}")
-        
-        # --- Granular Visual Feedback ---
-        posture = scores.get('posture_score', 5.0)
-        eye_contact = scores.get('eye_contact_score', 5.0)
-        expression = scores.get('expression_score', 5.0)
-        
-        visual_warnings = []
-        if posture < 6.0:
-            visual_warnings.append("posture (try sitting upright with shoulders back)")
-        if eye_contact < 6.0:
-            visual_warnings.append("eye contact (look at the camera more consistently)")
-        if expression < 6.0:
-            visual_warnings.append("facial expression (try to appear more engaged)")
-        
-        if visual_warnings:
-            st.warning(f" **Visuals:** Improve your {' and '.join(visual_warnings)}.")
-        else:
-            st.info(" **Visuals:** Great posture, eye contact, and engagement!")
-        
-        # Show sub-scores in an expander:
-        with st.expander("Visual Sub-Scores"):
-            vs1, vs2, vs3 = st.columns(3)
-            vs1.metric("Posture", f"{posture} / 10")
-            vs2.metric("Eye Contact", f"{eye_contact} / 10")
-            vs3.metric("Expression", f"{expression} / 10")
-            
-        # --- Audio Feedback ---
-        if scores.get('audio_performance_score', 0) < 5:
-            st.warning(" **Audio:** Try to modulate your speaking pace and pitch. Reduce background noise.")
-        else:
-            st.info(" **Audio:** Strong pacing and volume control!")
-        
-        # --- Text Feedback ---
-        text_score = scores.get('text_performance_score', 0)
-        if text_score < 2:
-            st.warning(f" **Text Quality ({text_score}/10):** Very poor grammar and many filler words. Significant improvement needed.")
-        elif text_score < 4:
-            st.warning(f" **Text Quality ({text_score}/10):** Focus on clearer sentence structure and reducing filler words.")
-        elif text_score < 7:
-            st.info(f"**Text Quality ({text_score}/10):** Acceptable grammar. Minor improvements in fluency would help.")
-        elif text_score < 9:
-            st.info(f"**Text Quality ({text_score}/10):** Good grammar with minor errors.")
-        else:
-            st.success(f" **Text Quality ({text_score}/10):** Strong grammar and professional language!")
-        
-        # --- Relevance Feedback & Recommendations ---
-        rel_score      = scores.get("relevance_score", 0)
-        rel_label      = scores.get("relevance_label", "")
-        rel_reason     = scores.get("relevance_reason", "")
-        rel_deductions = scores.get("relevance_deductions", [])
-        rel_prompt     = scores.get("relevance_prompt_used", meta.get("prompt", ""))
+    st.info("After recording in the new tab, click **Recording Ready** to check status.")
 
-        st.markdown("###  Prompt Relevance")
 
-        # Score + label row
-        rel_col1, rel_col2 = st.columns([1, 3])
-        rel_col1.metric("Relevance Score", f"{rel_score} / 10")
-        label_color = {"relevant": "✅", "partially_relevant": "⚠️", "irrelevant": "❌"}
-        rel_col2.markdown(
-            f"**Status:** {label_color.get(rel_label, '📊')} `{rel_label.replace('_', ' ').title() if rel_label else 'Pending'}`"
+# ─────────────────────────────────────────────────────────────────────────────
+# Analysis pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+if analyse_clicked and recording_ready and recording_path:
+    try: _READY_FILE.unlink()
+    except Exception: pass
+
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+    st.markdown("### Analysis in Progress…")
+    STEP_LABELS = [
+        "Extracting audio & transcribing speech",
+        "Analysing video — posture, eye contact, expression",
+        "Evaluating speech quality with LLM",
+        "Generating body language interpretation",
+        "Scoring text quality & grammar",
+        "Evaluating prompt relevance",
+        "Computing final scores",
+    ]
+    prog  = st.progress(0)
+    stxt  = st.empty()
+
+    def _prog(step, total, label):
+        prog.progress(step / total, text=label)
+        stxt.markdown(f"**{STEP_LABELS[step - 1]}…**")
+
+    from app.pipeline.batch_analyser import run_batch_analysis
+    try:
+        results = run_batch_analysis(
+            video_path=recording_path,
+            prompt=prompt_input,
+            performer_role=selected_performer,
+            target_role=selected_target,
+            progress_fn=_prog,
         )
+        prog.progress(1.0, text="Complete!")
+        stxt.markdown("**Analysis complete!**")
+        st.session_state["results"]       = results
+        st.session_state["res_prompt"]    = prompt_input
+        st.session_state["res_performer"] = selected_performer
+        st.session_state["res_target"]    = selected_target
+    except Exception as e:
+        st.error(f"Analysis failed: {e}")
+        st.stop()
 
-        # Prompt used for evaluation
-        if rel_prompt:
-            with st.expander(" Evaluated Against", expanded=False):
-                st.info(rel_prompt)
 
-        # LLM reason
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 4 — Results Dashboard
+# ─────────────────────────────────────────────────────────────────────────────
+if "results" in st.session_state:
+    results  = st.session_state["results"]
+    scores   = results.get("scores", {})
+    transcript    = results.get("transcript", "")
+    audio_metrics = results.get("audio_metrics", {})
+    audio_signal  = results.get("audio_signal_analysis", {})
+    audio_llm     = results.get("audio_llm", {})
+    video_metrics = results.get("video_metrics", {})
+    body_llm      = results.get("body_llm", {})
+    text_result   = results.get("text_result", {})
+    enh_prompt    = results.get("enhanced_prompt", st.session_state.get("res_prompt", ""))
+
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+    st.markdown("""<div class="step-card">
+      <div class="step-label">Step 4</div>
+      <div class="step-title">Your Session Scorecard</div>
+    </div>""", unsafe_allow_html=True)
+
+    cx1, cx2, cx3 = st.columns(3)
+    cx1.markdown(f"**Performer:** {st.session_state.get('res_performer','—')}")
+    cx2.markdown(f"**Target:** {st.session_state.get('res_target','—')}")
+    cx3.markdown(f"**Time:** {results.get('total_time_sec','—')} s")
+
+    ov = scores.get("overall_score", 0)
+    st.markdown(f"""<div style="background:linear-gradient(135deg,rgba(79,142,247,.1),rgba(139,92,246,.1));
+      border:1px solid rgba(79,142,247,.25);border-radius:18px;padding:28px;
+      text-align:center;margin:16px 0 24px">
+      <div style="font-size:.72rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
+        color:#8b949e;margin-bottom:8px">OVERALL PERFORMANCE SCORE</div>
+      <div class="{score_cls(ov)}"style="font-size:4rem;font-weight:900;line-height:1">{ov}</div>
+      <div style="font-size:.92rem;color:#8b949e;margin-top:4px">out of 10</div>
+    </div>""", unsafe_allow_html=True)
+
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    metric_card(sc1, "Video",     scores.get("visual_performance_score", 0))
+    metric_card(sc2, "Audio",    scores.get("audio_performance_score", 0))
+    metric_card(sc3, "Text",      scores.get("text_performance_score", 0))
+    metric_card(sc4, "Relevance", scores.get("relevance_score", 0))
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    tab_ov, tab_vid, tab_aud, tab_txt = st.tabs(
+        ["Overall", "Video", "Audio", "Text & Relevance"]
+    )
+
+    # ── Overall ───────────────────────────────────────────────────────────────
+    with tab_ov:
+        st.markdown("### Performance Snapshot")
+        try:
+            import pandas as pd, altair as alt
+            df = pd.DataFrame({
+                "Dimension": ["Video","Audio","Text","Relevance"],
+                "Score": [scores.get("visual_performance_score",0), scores.get("audio_performance_score",0),
+                          scores.get("text_performance_score",0), scores.get("relevance_score",0)],
+            })
+            chart = (alt.Chart(df).mark_bar(cornerRadiusTopLeft=6,cornerRadiusTopRight=6)
+                .encode(
+                    x=alt.X("Dimension:N",sort=None,axis=alt.Axis(labelColor="#8b949e",labelFontSize=13)),
+                    y=alt.Y("Score:Q",scale=alt.Scale(domain=[0,10]),axis=alt.Axis(labelColor="#8b949e")),
+                    color=alt.Color("Score:Q",scale=alt.Scale(domain=[0,5,8,10],
+                                    range=["#f43f5e","#f59e0b","#4f8ef7","#10b981"]),legend=None),
+                    tooltip=["Dimension","Score"])
+                .properties(height=220)
+                .configure_view(strokeWidth=0,fill="#00000000")
+                .configure_axis(grid=False,domain=False))
+            st.altair_chart(chart, use_container_width=True)
+        except Exception:
+            for d,v in zip(["Video","Audio","Text","Relevance"],
+                           [scores.get(k,0) for k in ["visual_performance_score","audio_performance_score",
+                                                       "text_performance_score","relevance_score"]]):
+                st.metric(d, f"{v}/10")
+
+        with st.expander("Full Transcript", expanded=False):
+            st.markdown(f"_{transcript or 'No transcript available.'}_")
+
+        strengths, gaps = [], []
+        for lbl, key in [("Video body language","visual_performance_score"),
+                         ("Audio delivery","audio_performance_score"),
+                         ("Text quality","text_performance_score"),
+                         ("Prompt relevance","relevance_score")]:
+            v = scores.get(key, 0)
+            if v >= 7: strengths.append(f"{score_label(v)} {lbl} ({v}/10)")
+            elif v < 5: gaps.append(f"{score_label(v)} {lbl} ({v}/10)")
+
+        ga, gb = st.columns(2)
+        with ga:
+            st.markdown("#### Strengths")
+            for s in (strengths or ["Keep practising to build strengths!"]): st.markdown(f"- {s}")
+        with gb:
+            st.markdown("#### Areas to Improve")
+            for g in (gaps or ["No major gaps — great session!"]): st.markdown(f"- {g}")
+
+    # ── Video ─────────────────────────────────────────────────────────────────
+    with tab_vid:
+        st.markdown("### Body Language Analysis")
+        v1,v2,v3,v4 = st.columns(4)
+        metric_card(v1,"Posture",       scores.get("posture_score",0))
+        metric_card(v2,"Eye Contact",   scores.get("eye_contact_score",0))
+        metric_card(v3,"Expression",    scores.get("expression_score",0))
+        metric_card(v4,"Head Stability",scores.get("head_stability_score",0))
+        if body_llm:
+            st.markdown(f"<br>**Overall:** {body_llm.get('overall_body_language','—')}", unsafe_allow_html=True)
+            if (interp := body_llm.get("body_language_interpretation","")): st.info(f"{interp}")
+            ba,bb,bc = st.columns(3)
+            with ba: st.markdown("**Posture**"); st.caption(body_llm.get("posture_analysis","—"))
+            with bb: st.markdown("**Eye Contact**"); st.caption(body_llm.get("eye_contact_analysis","—"))
+            with bc: st.markdown("**Expression**"); st.caption(body_llm.get("expression_analysis","—"))
+            if (sugg := body_llm.get("improvement_suggestions","")): st.warning(f"{sugg}")
+        st.markdown("#### Coaching Tips")
+        for lbl, key, bad, good in [
+            ("Posture","posture_score","Sit upright — shoulders back, spine tall.","Great posture!"),
+            ("Eye Contact","eye_contact_score","Look at the camera lens, not the screen.","Excellent gaze!"),
+            ("Expression","expression_score","Vary expressions — appear engaged and warm.","Good facial engagement!"),
+            ("Head Stability","head_stability_score","Minimise excessive head movement.","Steady and composed!"),
+        ]:
+            v = scores.get(key, 5)
+            (st.warning if v < 6 else st.success)(f"{lbl}: {bad if v < 6 else good}")
+
+    # ── Audio ─────────────────────────────────────────────────────────────────
+    with tab_aud:
+        st.markdown("### Audio & Speech Analysis")
+        a1,a2,a3 = st.columns(3)
+        metric_card(a1,"Clarity",      scores.get("speech_clarity_score",0))
+        metric_card(a2,"Confidence",    scores.get("confidence_score",0))
+        metric_card(a3,"Communication", scores.get("communication_score",0))
+        st.markdown("<br>#### Speech Signal Metrics", unsafe_allow_html=True)
+        sm1,sm2,sm3,sm4 = st.columns(4)
+        sm1.metric("WPM",           audio_metrics.get("wpm","—"))
+        sm2.metric("Filler Score",  audio_metrics.get("filler_score","—"))
+        sm3.metric("Pause Rate",    audio_metrics.get("pause_rate","—"))
+        sm4.metric("Silence Ratio", audio_signal.get("silence_ratio","—"))
+        with st.expander("Interpretation Details"):
+            for k,l in [("wpm_interpretation","WPM"),("filler_interpretation","Filler"),("pause_interpretation","Pause")]:
+                if (v := audio_metrics.get(k,"—")) != "—": st.markdown(f"**{l}:** {v}")
+            for k,l in [("energy_interpretation","Energy"),("pitch_interpretation","Pitch"),("silence_interpretation","Silence")]:
+                if (v := audio_signal.get(k,"—")) != "—": st.markdown(f"**{l}:** {v}")
+        if audio_llm:
+            st.markdown("#### LLM Feedback")
+            for key,label in [("tone_quality","Tone"),("voice_quality_feedback","Voice"),
+                               ("engagement_level","Engagement"),("communication_style","Style"),
+                               ("language_fluency","Fluency"),("professionalism_level","Professionalism"),
+                               ("filler_word_usage","Fillers")]:
+                if (v := audio_llm.get(key,"")): st.markdown(f"**{label}:** {v}")
+
+    # ── Text & Relevance ──────────────────────────────────────────────────────
+    with tab_txt:
+        st.markdown("### Text Quality & Relevance")
+        tr1,tr2 = st.columns(2)
+        metric_card(tr1,"Text Quality", scores.get("text_performance_score",0))
+        metric_card(tr2,"Relevance",    scores.get("relevance_score",0))
+        st.markdown("<br>#### Grammar & Fluency", unsafe_allow_html=True)
+        tm1,tm2 = st.columns(2)
+        tm1.metric("Grammar Errors", text_result.get("error_count","—"))
+        tm2.metric("Filler Words",   text_result.get("filler_count","—"))
+        if (fb := text_result.get("feedback","")):
+            t_sc = scores.get("text_performance_score",5)
+            (st.success if t_sc>=8 else st.info if t_sc>=6 else st.warning)(f"**Evaluator:** {fb}")
+        det_langs = text_result.get("detected_languages") or results.get("detected_languages", [])
+        if det_langs and det_langs != ["unknown"]:
+            st.markdown("**Languages:** " + ", ".join(f"**{l}**" for l in det_langs))
+            regional_langs = [lang for lang in det_langs if lang.lower() != "english"]
+            if len(regional_langs) > 2:
+                st.warning(
+                    "You are using more than 2 regional languages "
+                    f"({', '.join(regional_langs)}), which is not recommended."
+                )
+
+        st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+        st.markdown("#### Prompt Relevance")
+        rel_label   = scores.get("relevance_label","")
+        rel_reason  = scores.get("relevance_reason","")
+        rel_deducts = scores.get("relevance_deductions",[])
+        tag_map = {"relevant":'<span class="tag-pill tag-relevant"> Relevant</span>',
+                   "partially_relevant":'<span class="tag-pill tag-partial"> Partially Relevant</span>',
+                   "irrelevant":'<span class="tag-pill tag-irrelevant"> Irrelevant</span>'}
+        st.markdown(f"**Status:** {tag_map.get(rel_label, rel_label)}", unsafe_allow_html=True)
+        with st.expander("Prompt evaluated against", expanded=False): st.info(enh_prompt)
+        r_sc = scores.get("relevance_score",0)
         if rel_reason:
-            if rel_score >= 8:
-                st.success(f"**Evaluator Feedback:** {rel_reason}")
-            elif rel_score >= 5:
-                st.info(f"**Evaluator Feedback:** {rel_reason}")
-            else:
-                st.warning(f"**Evaluator Feedback:** {rel_reason}")
+            (st.success if r_sc>=8 else st.info if r_sc>=5 else st.warning)(f"**Evaluator:** {rel_reason}")
+        if rel_deducts:
+            with st.expander("Deductions Applied", expanded=r_sc<6):
+                for d in rel_deducts: st.markdown(f"- {d}")
 
-        # Deductions applied
-        if rel_deductions:
-            with st.expander(" Deductions Applied", expanded=rel_score < 6):
-                for d in rel_deductions:
-                    st.markdown(f"- {d}")
-
-        # Improvement recommendations based on target audience expectations
-        st.markdown("####  How to Be More Precise")
-        if rel_score >= 8:
-            st.success(
-                "Your answer was highly relevant. Keep anchoring responses to the "
-                "specific needs and context of your audience."
-            )
+        st.markdown("#### How to Improve Relevance")
+        t_role = persona_framework.get_role(st.session_state.get("res_target",""))
+        if r_sc >= 8:
+            st.success("Highly relevant — keep anchoring to your audience's specific needs.")
         else:
             tips = []
-
-            # Generic tips based on score band
-            if rel_score < 4:
-                tips += [
-                    "**Re-read the prompt** before answering — identify the core question.",
-                    "**Open with a direct statement** that addresses what was asked.",
-                    "**Avoid lengthy preambles** — get to the point within the first 2 sentences.",
-                ]
-            elif rel_score < 6:
-                tips += [
-                    "**Stay closer to the specific scenario** described in the prompt.",
-                    "**Reduce tangents** — if you drift, consciously redirect back.",
-                ]
+            if r_sc < 4:
+                tips += ["**Re-read the prompt** — identify the core question before answering.",
+                         "**Open with a direct statement** addressing what was asked.",
+                         "**Avoid long preambles** — make your point within 2 sentences."]
+            elif r_sc < 6:
+                tips += ["**Stay closer to the scenario** described in the prompt.",
+                         "**Reduce tangents** — consciously redirect back to the topic."]
             else:
-                tips += [
-                    "**Add specifics** — mention concrete examples or numbers relevant to the question.",
-                ]
-
-            # Audience-specific tips from persona expectations
-            if target_role:
-                expectations = target_role.requirements.get("expectations", [])
-                if expectations:
-                    tips.append(
-                        f"**Speak to *{target_role.name}*'s expectations specifically:**"
-                    )
-                    for exp in expectations:
-                        tips.append(f"  - {exp}")
-
-            # Structural tip
-            tips.append(
-                "**Use the PREP structure:** Point → Reason → Example → Point (restate). "
-                "This keeps answers focused and memorable."
-            )
-
-            for tip in tips:
-                st.markdown(f"- {tip}")
-
+                tips += ["**Add specifics** — concrete examples or numbers."]
+            if t_role:
+                exps = t_role.requirements.get("expectations",[])
+                if exps:
+                    tips.append(f"**Speak to *{t_role.name}*'s expectations:**")
+                    tips += [f"- {e}" for e in exps]
+            tips.append("**Use PREP:** Point → Reason → Example → Point (restate).")
+            for tip in tips: st.markdown(f"- {tip}")
