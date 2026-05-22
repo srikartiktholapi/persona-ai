@@ -17,20 +17,34 @@ import os
 import shutil
 from fastapi import FastAPI, UploadFile, File
 from dotenv import load_dotenv
-from utils.file_utils import download_video
 import uuid
 import time
 import requests
 from fastapi import Body
-from utils.video_utils import analyze_video
-from utils.audio_utils import process_audio
-from utils.scoring_utils import score_audio
-from utils.scoring_utils import score_audio, evaluate_answer_relevance
-from utils.scoring_utils import score_audio, body_language_interpretation,interpret_body_language
-from utils.scoring_utils import calculate_body_score, calculate_audio_total
+from app.agents.video import analyze_video
+from app.agents.audio import process_audio
+from app.agents.scoring import (
+    score_audio, evaluate_answer_relevance, interpret_body_language,
+    calculate_body_score, calculate_audio_total
+)
+
+def download_video(video_url: str, save_dir="uploads"):
+    os.makedirs(save_dir, exist_ok=True)
+    video_id = str(uuid.uuid4())
+    video_path = os.path.join(save_dir, f"{video_id}.mp4")
+    with requests.get(video_url, stream=True, timeout=30) as r:
+        r.raise_for_status()
+        with open(video_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk: f.write(chunk)
+    return video_path, video_id
 
 load_dotenv()
 app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"message": "Welcome to Persona AI API. API is running."}
 
 @app.post("/analyze")
 async def start_analysis(file: UploadFile = File(...)):
@@ -46,14 +60,14 @@ async def start_analysis(file: UploadFile = File(...)):
     prefix = os.path.splitext(file.filename)[0]
 
     # =========================
-    # 🎥 BODY LANGUAGE
+    # BODY LANGUAGE
     # =========================
     start_body = time.time()
     body_data = analyze_video(video_path)
     body_time = round(time.time() - start_body, 2)
 
     # =========================
-    # 🎧 AUDIO PROCESSING
+    # AUDIO PROCESSING
     # =========================
     start_audio = time.time()
     audio_data = process_audio(
@@ -64,7 +78,7 @@ async def start_analysis(file: UploadFile = File(...)):
     audio_time = round(time.time() - start_audio, 2)
 
     # =========================
-    # 🧠 AI SCORING
+    # AI SCORING
     # =========================
     start_ai = time.time()
 
