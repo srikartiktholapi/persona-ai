@@ -14,6 +14,24 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def build_scenario_context(persona=None, activity=None, task=None) -> str:
+    """Build a scenario summary from the selected persona/activity/task."""
+    lines = ["Scenario context (persona/activity/task):"]
+
+    if persona:
+        lines.append(f"- Persona: {persona.get('name', 'Unknown persona')}")
+    if activity:
+        lines.append(f"- Activity: {activity.get('activity_name', 'Unknown activity')}")
+        if activity.get("description"):
+            lines.append(f"- Activity description: {activity['description']}")
+    if task:
+        lines.append(f"- Task: {task.get('task_name', 'Unknown task')}")
+        if task.get("description"):
+            lines.append(f"- Task description: {task['description']}")
+
+    return "\n".join(lines)
+
+
 def run_batch_analysis(
     video_path: str,
     prompt: str,
