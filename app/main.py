@@ -42,7 +42,6 @@ def download_video(video_url: str, save_dir="uploads"):
 
 load_dotenv()
 app = FastAPI()
-
 @app.get("/")
 def root():
     return {"message": "Welcome to Persona AI API. API is running."}

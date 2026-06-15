@@ -32,12 +32,33 @@ def build_scenario_context(persona=None, activity=None, task=None) -> str:
     return "\n".join(lines)
 
 
+def build_analysis_prompt(selected_scenario=None, manual_prompt: str = "") -> str:
+    """Build the analysis prompt from the selected scenario and ignore manual text."""
+    scenario = selected_scenario or {}
+    persona = scenario.get("persona") or {}
+    activity = scenario.get("activity") or {}
+    task = scenario.get("task") or {}
+
+    scenario_context = build_scenario_context(persona, activity, task)
+    scenario_summary = (
+        f"{scenario_context}\n\n"
+        "Use this selected scenario as the evaluation target. "
+        "Assess the candidate's performance against the scenario, not a separate manual question."
+    )
+
+    if persona.get("name") or activity.get("activity_name") or task.get("task_name"):
+        return scenario_summary
+
+    return manual_prompt or "Analyze the recorded session against the selected scenario."
+
+
 def run_batch_analysis(
     video_path: str,
-    prompt: str,
-    performer_role: str,
-    target_role: str,
+    prompt: str = "",
+    performer_role: str = "",
+    target_role: str = "",
     progress_fn=None,
+    selected_scenario=None,
 ) -> dict:
     """
     Run the full post-session analysis pipeline on a recorded video file.
@@ -79,6 +100,11 @@ def run_batch_analysis(
 
     t0 = time.time()
     results: dict = {}
+
+    analysis_prompt = build_analysis_prompt(
+        selected_scenario=selected_scenario,
+        manual_prompt=prompt,
+    )
 
     # ── 1. AUDIO EXTRACTION + TRANSCRIPTION ─────────────────────────────────
     _progress("Extracting audio & transcribing speech…")
@@ -140,7 +166,7 @@ def run_batch_analysis(
     _progress("Evaluating prompt relevance…")
     try:
         # Enrich prompt with persona context
-        enhanced_prompt = prompt
+        enhanced_prompt = analysis_prompt
         if performer_role and target_role:
             p = persona_framework.get_role(performer_role)
             t = persona_framework.get_role(target_role)
@@ -148,7 +174,7 @@ def run_batch_analysis(
                 enhanced_prompt = (
                     f"Performer role: {p.name} — {p.requirements['description']}. "
                     f"Target audience: {t.name} — {t.requirements['description']}. "
-                    f"{prompt}"
+                    f"{analysis_prompt}"
                 )
         relevance_result = evaluate_answer_relevance(
             enhanced_prompt, transcript, settings.OPENAI_API_KEY

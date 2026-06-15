@@ -7,7 +7,6 @@ Architecture:
   - User returns to Streamlit tab, hits Analyse
   - Full batch pipeline runs → scorecard
 """
-
 import os
 import json
 import pathlib
@@ -875,12 +874,6 @@ with st.expander("Step 0 — Persona / Activity / Task", expanded=True):
             "task": selected_db_task,
         }
 
-    prompt_input = st.text_area(
-        "Prompt / Question",
-        value="Introduce yourself and explain the value you bring to the customer.",
-        height=72, key="prompt_input",
-    )
-
     selected_performer = selected_db_persona["name"] if selected_db_persona else "Unknown Performer"
     selected_target = selected_db_activity["activity_name"] if selected_db_activity else "Unknown Target"
 
@@ -967,17 +960,24 @@ if analyse_clicked and recording_ready and recording_path:
 
     from app.pipeline.batch_analyser import run_batch_analysis
     try:
+        selected_scenario = {
+            "persona": selected_db_persona,
+            "activity": selected_db_activity,
+            "task": selected_db_task,
+        }
+
         results = run_batch_analysis(
             video_path=recording_path,
-            prompt=prompt_input,
+            prompt="",
             performer_role=selected_performer,
             target_role=selected_target,
             progress_fn=_prog,
+            selected_scenario=selected_scenario,
         )
         prog.progress(1.0, text="Complete!")
         stxt.markdown("**Analysis complete!**")
         st.session_state["results"]       = results
-        st.session_state["res_prompt"]    = prompt_input
+        st.session_state["res_prompt"]    = "Scenario-based analysis"
         st.session_state["res_performer"] = selected_performer
         st.session_state["res_target"]    = selected_target
     except Exception as e:
