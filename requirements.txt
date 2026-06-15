@@ -10,7 +10,7 @@ pytest>=7.4.2
 grandalf>=0.6
 
 python-multipart
-mediapipe==0.10.14
+mediapipe==0.10.35
 openai
 pandas
 openpyxl

@@ -297,7 +297,7 @@ def analyze_audio_signal(audio_path):
         silence_interp = "Frequent pauses detected indicating hesitation."
 
     return {
-        "voice_energy": round(avg_energy,4),
+        "voice_energy": round(avg_energy,4),      
         "energy_interpretation": energy_interp,
 
         "pitch_variation": round(pitch_std,2),
@@ -443,7 +443,6 @@ def process_audio(video_path, prefix, sarvam_key):
                     language_max_probability.get(script_lang, 0.0),
                     0.90,
                 )
-
         os.remove(chunk_path)
 
     full_transcript = " ".join(final_text)

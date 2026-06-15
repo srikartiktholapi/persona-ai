@@ -94,7 +94,10 @@ def run_batch_analysis(
 
     # ── 4. LLM — BODY LANGUAGE NARRATIVE ──────────────────────────────────
     _progress("Generating body language interpretation…")
+    video_available = video_metrics.get("video_analysis_available", True)
     try:
+        if not video_available:
+            raise ValueError(video_metrics.get("video_analysis_status", "Video analysis unavailable."))
         body_scores = calculate_body_score(video_metrics)
         body_llm = body_language_interpretation(body_scores, settings.OPENAI_API_KEY)
     except Exception as e:
@@ -142,13 +145,17 @@ def run_batch_analysis(
     _progress("Computing final scores…")
 
     # Video sub-scores (0–10 each)
-    posture_score    = video_metrics.get("posture_score", 5.0)
-    eye_score        = video_metrics.get("eye_contact_score", 5.0)
-    expr_score       = video_metrics.get("expression_score", 5.0)
-    head_score       = video_metrics.get("head_stability", 5.0)
-    visual_score     = round(
-        0.35 * posture_score + 0.30 * eye_score + 0.20 * expr_score + 0.15 * head_score, 2
-    )
+    if video_available:
+        posture_score    = video_metrics.get("posture_score", 5.0)
+        eye_score        = video_metrics.get("eye_contact_score", 5.0)
+        expr_score       = video_metrics.get("expression_score", 5.0)
+        head_score       = video_metrics.get("head_stability", 5.0)
+        visual_score     = round(
+            0.35 * posture_score + 0.30 * eye_score + 0.20 * expr_score + 0.15 * head_score, 2
+        )
+    else:
+        posture_score = eye_score = expr_score = head_score = None
+        visual_score = None
 
     # Audio LLM sub-scores (0–10 each)
     clarity_score    = audio_llm.get("speech_clarity_score out of 10",
@@ -169,8 +176,9 @@ def run_batch_analysis(
     rel_score = round(max(0.0, min(10.0, float(raw_rel) / 5.0)), 2) if raw_rel is not None else 5.0
 
     # Weighted overall: 20% video, 25% audio, 20% text, 35% relevance
+    overall_visual_score = visual_score if visual_score is not None else 5.0
     overall = round(
-        0.20 * visual_score +
+        0.20 * overall_visual_score +
         0.25 * audio_score  +
         0.20 * text_score   +
         0.35 * rel_score,
@@ -179,10 +187,12 @@ def run_batch_analysis(
 
     scores = {
         "visual_performance_score": visual_score,
-        "posture_score":            round(posture_score, 2),
-        "eye_contact_score":        round(eye_score, 2),
-        "expression_score":         round(expr_score, 2),
-        "head_stability_score":     round(head_score, 2),
+        "posture_score":            round(posture_score, 2) if posture_score is not None else None,
+        "eye_contact_score":        round(eye_score, 2) if eye_score is not None else None,
+        "expression_score":         round(expr_score, 2) if expr_score is not None else None,
+        "head_stability_score":     round(head_score, 2) if head_score is not None else None,
+        "video_analysis_available": video_available,
+        "video_analysis_status":    video_metrics.get("video_analysis_status", ""),
 
         "audio_performance_score":  audio_score,
         "speech_clarity_score":     round(float(clarity_score), 2),

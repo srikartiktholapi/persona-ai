@@ -3,6 +3,7 @@ import numpy as np
 import logging
 from app.core.config import settings
 from sarvamai import SarvamAI
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import soundfile as sf
 import tempfile
 import os
@@ -129,7 +130,6 @@ def process(state: AgentState) -> dict:
         sf.write(temp_path, y, sr)
 
         if settings.SARVAM_API_KEY:
-            import threading as _threading
             client = SarvamAI(api_subscription_key=settings.SARVAM_API_KEY)
 
             # ── Always-on parallel probes for the 4 most commonly missed languages ─
@@ -149,46 +149,37 @@ def process(state: AgentState) -> dict:
             ]
             probe_results: list = [{} for _ in _ALWAYS_PROBE]
 
-            def _probe_call(path, code, name, out):
+            def _probe_call(path, code, name):
                 try:
                     _c = SarvamAI(api_subscription_key=settings.SARVAM_API_KEY)
                     with open(path, "rb") as _f:
-                        _r = _c.speech_to_text.transcribe(
+                        res = _c.speech_to_text.transcribe(
                             file=_f,
                             model=settings.SPEECH_TO_TEXT_MODEL,
                             language_code=code,
                             mode="codemix",
                         )
-                    out["name"]  = name
-                    out["code"]  = code
-                    out["text"]  = getattr(_r, "transcript", "") or ""
-                    out["prob"]  = float(getattr(_r, "language_probability", None) or 0.0)
-                    out["api_code"] = getattr(_r, "language_code", None)
+                    return {
+                        "name": name,
+                        "code": code,
+                        "text": getattr(res, "transcript", "") or "",
+                        "prob": float(getattr(res, "language_probability", None) or 0.0),
+                        "api_code": getattr(res, "language_code", None)
+                    }
                 except Exception as _ex:
-                    out["error"] = str(_ex)
+                    return {"error": str(_ex)}
 
-            probe_threads = []
-            for (code, name), out in zip(_ALWAYS_PROBE, probe_results):
-                t = _threading.Thread(
-                    target=_probe_call,
-                    args=(temp_path, code, name, out),
-                    daemon=True,
-                )
-                t.start()
-                probe_threads.append(t)
+            # Use a ThreadPoolExecutor for better resource management
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                # Schedule probes and the primary "unknown" call
+                future_to_probe = {executor.submit(_probe_call, temp_path, code, name): name for code, name in _ALWAYS_PROBE}
+                primary_future = executor.submit(_probe_call, temp_path, settings.SPEECH_LANGUAGE_CODE, "primary")
 
-            # ── Primary call: unknown / auto-detect (runs concurrently) ──────
-            with open(temp_path, "rb") as f:
-                resp = client.speech_to_text.transcribe(
-                    file=f,
-                    model=settings.SPEECH_TO_TEXT_MODEL,
-                    language_code=settings.SPEECH_LANGUAGE_CODE,   # "unknown"
-                    mode="codemix",
-                )
-
-            # Wait for all probes to finish
-            for t in probe_threads:
-                t.join(timeout=6.0)
+                # Wait for primary and gather probe results
+                resp_data = primary_future.result(timeout=10.0)
+                probe_results = []
+                for future in as_completed(future_to_probe):
+                    probe_results.append(future.result())
 
             # ── Merge probe results via TRANSCRIPT SCRIPT DETECTION ───────────
             # This is deterministic: Bengali Unicode chars can ONLY come from Bengali.
@@ -226,10 +217,8 @@ def process(state: AgentState) -> dict:
                     if lang_max_prob.get(slang, 0.0) < 0.90:
                         lang_max_prob[slang] = 0.90
 
-            # ── Extract primary transcript ────────────────────────────────────
-            text = (getattr(resp, "transcript", None)
-                    or getattr(resp, "text", None)
-                    or str(resp))
+            # ── Extract primary transcript (resp_data is now a dict) ──────────
+            text = resp_data.get("text", "")
             if text.strip():
                 rolling = (rolling + " " + text.strip()).strip()
 
@@ -242,8 +231,8 @@ def process(state: AgentState) -> dict:
                         lang_max_prob[slang] = 0.90
 
             # ── Primary API language code from unknown call ───────────────────
-            api_lang_code   = getattr(resp, "language_code", None)
-            api_probability = float(getattr(resp, "language_probability", None) or 0.0)
+            api_lang_code   = resp_data.get("api_code")
+            api_probability = resp_data.get("prob", 0.0)
             api_lang_name   = _LANG_CODE_MAP.get(api_lang_code, api_lang_code) if api_lang_code else None
             if api_lang_name and api_lang_name != "unknown":
                 lang_counts[api_lang_name]   = lang_counts.get(api_lang_name, 0) + 1
@@ -254,17 +243,13 @@ def process(state: AgentState) -> dict:
 
             # ── Debug dump ───────────────────────────────────────────────────
             try:
-                resp_dump = {
-                    k: str(getattr(resp, k))
-                    for k in dir(resp)
-                    if not k.startswith("_") and not callable(getattr(resp, k, None))
-                }
-                resp_dump["_probes"] = [
+                resp_dump = resp_data.copy()
+                resp_dump["probes"] = [
                     {"lang": p.get("name"), "script_hits": _detect_languages_from_text(p.get("text",""))}
                     for p in probe_results if "name" in p
                 ]
             except Exception:
-                resp_dump = {"raw": str(resp)}
+                resp_dump = {"raw": str(resp_data)}
             logger.error("SARVAM RAW RESPONSE: %s", resp_dump)
             ts["last_sarvam_response"] = resp_dump
             ts["last_transcript_chunk"] = text.strip() if text.strip() else ""
@@ -299,4 +284,3 @@ def process(state: AgentState) -> dict:
             ts["detected_language_name"] = non_eng[-1]
 
     return {"transcript_state": ts}
-

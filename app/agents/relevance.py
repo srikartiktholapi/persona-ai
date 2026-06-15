@@ -2,6 +2,7 @@ import logging
 from app.orchestrator.state import AgentState
 from app.agents.scoring import evaluate_answer_relevance
 from app.core.config import settings
+from app.core.persona import persona_framework
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +31,6 @@ def process(state: AgentState) -> dict:
     target_role = meta.get("target_role", None)
     practice_category = meta.get("practice_category", None)
     
-    # Compose prompt dynamically based on persona framework if available
-    from app.core.persona import persona_framework
     
     if practice_category:
         default_prompts = {

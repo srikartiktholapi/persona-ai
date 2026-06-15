@@ -16,6 +16,7 @@ import threading
 import http.server
 import socketserver
 import streamlit as st
+from app.core.db import fetch_activities, fetch_personas, fetch_tasks
 from app.core.persona import persona_framework, performer_roles, target_roles
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -23,7 +24,7 @@ from app.core.persona import persona_framework, performer_roles, target_roles
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Persona AI — Session Analyser",
-    page_icon=None,
+  page_icon="🎥",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -351,13 +352,14 @@ header[data-testid="stHeader"]{display:none}
 .hero-title{font-size:1.8rem;font-weight:800;margin:0;
   background:linear-gradient(135deg,#4f8ef7,#8b5cf6);
   -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-.hero-sub{font-size:.88rem;color:var(--muted);margin:3px 0 0}
+.hero-sub{font-size:.95rem;color:#374151;margin:8px 0 0;line-height:1.6}
 
-.step-card{background:var(--bg-card);border:1px solid var(--border);border-radius:16px;
-  padding:20px 24px;margin-bottom:16px;backdrop-filter:blur(10px);box-shadow:0 10px 30px rgba(44,62,95,.08)}
-.step-label{font-size:.66rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
-  color:var(--blue);margin-bottom:4px}
-.step-title{font-size:1.08rem;font-weight:700;color:var(--text)}
+.step-card{background:#ffffff;border:1px solid rgba(23,32,51,.12);border-radius:18px;
+  padding:24px 26px;margin-bottom:18px;backdrop-filter:blur(12px);box-shadow:0 18px 40px rgba(44,62,95,.12)}
+.step-label{font-size:.72rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
+  color:#2563eb;margin-bottom:6px}
+.step-title{font-size:1.18rem;font-weight:800;color:#111827;line-height:1.25;margin-bottom:4px}
+.section-heading{font-size:1rem;font-weight:800;color:#111827;margin:20px 0 12px;letter-spacing:.01em}
 
 .rec-launch{
   display:flex;flex-direction:column;align-items:center;justify-content:center;
@@ -380,84 +382,513 @@ header[data-testid="stHeader"]{display:none}
 .metric-value{font-size:2.2rem;font-weight:900;line-height:1;margin-bottom:4px}
 .metric-label{font-size:.74rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.05em}
 .score-great{color:#10b981}.score-good{color:#4f8ef7}.score-ok{color:#f59e0b}.score-poor{color:#f43f5e}
+.score-na{color:#64748b}
 
 .hr{height:1px;background:var(--border);margin:20px 0}
 .tag-pill{display:inline-block;padding:3px 10px;border-radius:999px;font-size:.7rem;font-weight:700;
   letter-spacing:.05em;text-transform:uppercase}
-.tag-relevant{background:rgba(16,185,129,.15);color:#10b981}
-.tag-partial{background:rgba(245,158,11,.15);color:#f59e0b}
-.tag-irrelevant{background:rgba(244,63,94,.15);color:#f43f5e}
+.tag-relevant{background:rgba(16,185,129,.15) !important;color:#10b981 !important;-webkit-text-fill-color:#10b981 !important}
+.tag-partial{background:rgba(245,158,11,.15) !important;color:#d97706 !important;-webkit-text-fill-color:#d97706 !important}
+.tag-irrelevant{background:rgba(244,63,94,.15) !important;color:#e11d48 !important;-webkit-text-fill-color:#e11d48 !important}
 
+/* ── Expander: header button only gets white text, NOT the body ── */
+button[data-testid="stExpanderToggleButton"] {color:#111827 !important}
+button[data-testid="stExpanderToggleButton"] > * {color:#111827 !important}
+button[data-testid="stExpanderToggleButton"] p {color:#111827 !important}
+[data-testid="stExpander"] > div:first-child button > div > p {color:#111827 !important}
+/* Expander body: always dark text */
+[data-testid="stExpanderDetails"] p,
+[data-testid="stExpanderDetails"] li,
+[data-testid="stExpanderDetails"] span,
+[data-testid="stExpanderDetails"] div,
+[data-testid="stExpanderDetails"] label{
+  color:#111827 !important;
+  -webkit-text-fill-color:#111827 !important;
+}
+
+.stSelectbox svg {color:#fff !important}
+.stSelectbox [data-testid="stSelectbox-select"] {color:#fff !important}
+.stSelectbox [role="combobox"] {color:#fff !important}
+.stSelectbox > div > div {color:#fff !important}
 .stTabs [role="tablist"]{background:var(--bg-glass);border-radius:12px;border:1px solid var(--border);padding:4px;gap:4px}
 .stTabs [role="tab"]{border-radius:8px !important;font-weight:600 !important;color:var(--muted) !important}
 .stTabs [role="tab"][aria-selected="true"]{background:linear-gradient(135deg,#4f8ef7,#8b5cf6) !important;color:#fff !important}
-[data-testid="stExpander"]{background:var(--bg-glass);border:1px solid var(--border) !important;border-radius:12px}
+[data-testid="stExpander"]{background:var(--bg-glass);border:1px solid var(--border) !important;border-radius:12px;color:var(--text) !important}
 .stMetric label{color:var(--muted) !important;font-weight:500 !important}
 .stMetric [data-testid="stMetricValue"]{color:var(--text) !important;font-weight:800 !important}
 button[kind="primary"]{background:linear-gradient(135deg,#4f8ef7,#8b5cf6) !important;border:none !important;
-  border-radius:10px !important;font-weight:700 !important}
+  border-radius:10px !important;font-weight:700 !important;color:#fff !important}
 button[kind="primary"]:hover{opacity:.86 !important}
 button[kind="secondary"]{background:var(--bg-glass) !important;border-color:var(--border) !important;
   color:var(--text) !important;border-radius:10px !important;font-weight:600 !important}
-.stSelectbox>div,.stTextArea>div{background:var(--bg-glass) !important;border-color:var(--border) !important;border-radius:10px !important}
+.stSelectbox label,.stTextArea label,[data-testid="stWidgetLabel"] *{color:var(--text) !important}
+.stSelectbox>div,.stTextArea>div{background:#fff !important;border-color:var(--border) !important;border-radius:10px !important}
+.stSelectbox [data-baseweb="select"],
+.stSelectbox [data-baseweb="select"] > div,
+.stTextArea textarea{
+  background:#fff !important;
+  border-color:rgba(31,41,55,.16) !important;
+  color:#111827 !important;
+  -webkit-text-fill-color:#111827 !important;
+}
+.stSelectbox [data-baseweb="select"] *,
+.stSelectbox [role="combobox"] *{
+  color:#111827 !important;
+  -webkit-text-fill-color:#111827 !important;
+}
+.stTextArea textarea::placeholder{
+  color:#6b7280 !important;
+  -webkit-text-fill-color:#6b7280 !important;
+  opacity:1 !important;
+}
+[data-baseweb="popover"] [role="listbox"],
+[data-baseweb="popover"] [role="option"],
+[data-baseweb="popover"] [role="option"] *{
+  background:#fff !important;
+  color:var(--text) !important;
+  -webkit-text-fill-color:var(--text) !important;
+}
 .stProgress>div>div>div{background:linear-gradient(90deg,#4f8ef7,#8b5cf6) !important;border-radius:99px}
+input, textarea, select {color:inherit !important}
+
+/* ── Main content text always readable ── */
+.stMarkdown p, .stMarkdown li, .stMarkdown span,
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] li,
+[data-testid="stMarkdownContainer"] ul,
+[data-testid="stMarkdownContainer"] ol{
+  color:#111827 !important;
+  -webkit-text-fill-color:#111827 !important;
+}
+/* Status tag pills keep their own colors */
+.tag-pill{color:unset !important; -webkit-text-fill-color:unset !important;}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<style>
+/* UI polish pass: light, high-contrast dashboard styling */
+.block-container{
+  max-width:1180px;
+  padding-top:22px;
+  padding-bottom:52px;
+}
+
+.stApp{
+  background:
+    linear-gradient(180deg,rgba(255,255,255,.72),rgba(255,255,255,0) 280px),
+    linear-gradient(135deg,#edf6ff 0%,#f8fbff 46%,#f1f5ff 100%) !important;
+}
+
+.hero{
+  min-height:156px;
+  align-items:flex-start;
+  justify-content:space-between;
+  border-radius:18px;
+  padding:30px 34px;
+  background:
+    linear-gradient(135deg,rgba(255,255,255,.98),rgba(239,246,255,.95) 55%,rgba(245,243,255,.95)),
+    radial-gradient(circle at 88% 18%,rgba(79,142,247,.22),transparent 32%) !important;
+  border:1px solid rgba(37,99,235,.14) !important;
+  box-shadow:0 18px 50px rgba(31,41,55,.12) !important;
+}
+.hero::before{display:none}
+.hero-icon{
+  color:#111827;
+  font-size:2.8rem;
+  font-weight:800;
+  letter-spacing:0;
+  line-height:1;
+}
+.hero-copy{max-width:620px}
+.hero-kicker{
+  color:#2563eb;
+  font-size:.78rem;
+  font-weight:800;
+  letter-spacing:.12em;
+  text-transform:uppercase;
+  margin-bottom:10px;
+}
+.hero-title{
+  font-size:2rem !important;
+  color:#111827 !important;
+  background:none !important;
+  -webkit-text-fill-color:#111827 !important;
+}
+.hero-sub{
+  max-width:560px;
+  color:#4b5563 !important;
+  font-size:1rem !important;
+}
+.hero-pills{
+  display:flex;
+  gap:10px;
+  flex-wrap:wrap;
+  margin-top:18px;
+}
+.hero-pill{
+  display:inline-flex;
+  align-items:center;
+  min-height:30px;
+  padding:6px 12px;
+  border-radius:999px;
+  color:#1f2937;
+  background:rgba(255,255,255,.82);
+  border:1px solid rgba(37,99,235,.16);
+  font-size:.78rem;
+  font-weight:700;
+}
+
+.step-card{
+  display:flex;
+  align-items:center;
+  gap:14px;
+  padding:18px 20px !important;
+  border-radius:14px !important;
+  background:#fff !important;
+  box-shadow:0 12px 32px rgba(31,41,55,.08) !important;
+}
+.step-label{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  min-width:76px;
+  min-height:32px;
+  margin:0 !important;
+  border-radius:999px;
+  color:#2563eb !important;
+  background:#eff6ff;
+  border:1px solid #bfdbfe;
+  letter-spacing:.08em !important;
+}
+.step-title{
+  margin:0 !important;
+  color:#111827 !important;
+}
+
+[data-testid="stExpander"]{
+  overflow:hidden;
+  background:#fff !important;
+  border:1px solid rgba(31,41,55,.1) !important;
+  border-radius:14px !important;
+  box-shadow:0 14px 36px rgba(31,41,55,.08);
+}
+[data-testid="stExpander"] details > summary,
+[data-testid="stExpander"] button[data-testid="stExpanderToggleButton"]{
+  background:linear-gradient(135deg,#f8fbff,#eef6ff) !important;
+  border-bottom:1px solid rgba(31,41,55,.08);
+}
+/* Expander header label - dark text */
+[data-testid="stExpander"] button *,
+[data-testid="stExpander"] summary *,
+[data-testid="stExpander"] > div:first-child button > div > p{
+  color:#111827 !important;
+  -webkit-text-fill-color:#111827 !important;
+}
+/* Expander body content - always dark readable text */
+[data-testid="stExpanderDetails"],
+[data-testid="stExpanderDetails"] *:not(.tag-pill):not(.tag-relevant):not(.tag-partial):not(.tag-irrelevant){
+  color:#111827 !important;
+  -webkit-text-fill-color:#111827 !important;
+}
+[data-testid="stExpanderDetails"]{
+  padding:20px 20px 22px;
+}
+
+.section-heading{
+  margin:22px 0 14px !important;
+  color:#111827 !important;
+}
+
+.stSelectbox label,.stTextArea label,[data-testid="stWidgetLabel"] *{
+  color:#172033 !important;
+  font-weight:650 !important;
+}
+.stSelectbox>div,.stTextArea>div{
+  background:#fff !important;
+  border-radius:11px !important;
+}
+.stSelectbox [data-baseweb="select"],
+.stSelectbox [data-baseweb="select"] > div,
+.stTextArea textarea{
+  min-height:48px;
+  background:#fff !important;
+  border:1px solid rgba(31,41,55,.16) !important;
+  border-radius:11px !important;
+  color:#111827 !important;
+  -webkit-text-fill-color:#111827 !important;
+  box-shadow:0 1px 2px rgba(31,41,55,.04);
+}
+.stTextArea textarea{
+  padding:13px 14px !important;
+  line-height:1.55 !important;
+}
+.stSelectbox [data-baseweb="select"] *,
+.stSelectbox [role="combobox"] *,
+.stTextArea textarea{
+  color:#111827 !important;
+  -webkit-text-fill-color:#111827 !important;
+}
+.stTextArea textarea::placeholder{
+  color:#6b7280 !important;
+  -webkit-text-fill-color:#6b7280 !important;
+}
+.stSelectbox svg{
+  color:#4b5563 !important;
+}
+.stSelectbox [data-baseweb="select"]:focus-within,
+.stTextArea textarea:focus{
+  border-color:#4f8ef7 !important;
+  box-shadow:0 0 0 3px rgba(79,142,247,.16) !important;
+}
+
+.rec-launch{
+  background:#fff !important;
+  border:1px solid rgba(37,99,235,.16) !important;
+  border-radius:16px !important;
+  box-shadow:0 14px 36px rgba(31,41,55,.08);
+}
+.rec-btn-link{
+  border-radius:11px !important;
+  box-shadow:0 12px 26px rgba(37,99,235,.24) !important;
+}
+.rec-hint{
+  color:#4b5563 !important;
+}
+
+button[kind="primary"],button[kind="secondary"]{
+  min-height:46px;
+}
+button[kind="primary"]{
+  box-shadow:0 10px 22px rgba(79,142,247,.25) !important;
+}
+button[kind="secondary"]{
+  background:#fff !important;
+  border:1px solid rgba(31,41,55,.14) !important;
+}
+
+.metric-card{
+  background:#fff !important;
+  border:1px solid rgba(31,41,55,.1) !important;
+  border-radius:12px !important;
+  box-shadow:0 10px 26px rgba(31,41,55,.07);
+}
+.metric-value{
+  font-size:2.35rem !important;
+}
+.metric-label{
+  color:#4b5563 !important;
+}
+
+.stTabs [role="tablist"]{
+  background:#fff !important;
+  box-shadow:0 8px 24px rgba(31,41,55,.06);
+}
+.stTabs [role="tab"]{
+  color:#4b5563 !important;
+}
+.stTabs [role="tab"][aria-selected="true"]{
+  color:#fff !important;
+}
+
+[data-testid="stAlert"]{
+  border-radius:12px !important;
+  border:1px solid rgba(31,41,55,.08) !important;
+}
+
+@media (max-width:760px){
+  .block-container{padding-left:16px;padding-right:16px}
+  .hero{padding:24px 20px;flex-direction:column}
+  .hero-title{font-size:1.55rem !important}
+  .hero-icon{font-size:2.1rem}
+  .step-card{align-items:flex-start;flex-direction:column;gap:8px}
+}
 </style>
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Hero
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown("""<div class="hero">
-  <div class="hero-icon">Persona AI</div>
-  <div>
-    <div class="hero-title">Persona AI — Session Analyser</div>
-    <div class="hero-sub">Record · Analyse · Improve — full AI scorecard in seconds</div>
-  </div>
-</div>
-""", unsafe_allow_html=True)
+def render_hero(title: str = "Session Analyser", subtitle: str = "Record, analyse, and improve with a full AI scorecard in seconds."):
+    st.markdown(f"""<div class="hero">
+      <div class="hero-copy">
+        <div class="hero-kicker">Persona AI</div>
+        <div class="hero-title">{title}</div>
+        <div class="hero-sub">{subtitle}</div>
+        <div class="hero-pills">
+          <span class="hero-pill">Video</span>
+          <span class="hero-pill">Audio</span>
+          <span class="hero-pill">Text</span>
+          <span class="hero-pill">Relevance</span>
+        </div>
+      </div>
+      <div class="hero-icon">Persona AI</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+render_hero()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def score_cls(v): return "score-great" if v>=8 else "score-good" if v>=6 else "score-ok" if v>=4 else "score-poor"
-def score_label(v): return "Strong" if v>=8 else "Good" if v>=6 else "Needs work" if v>=4 else "Low"
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_db_personas():
+  """Load personas from the DB (cached for 10 minutes)."""
+  return fetch_personas()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_db_activities(persona_id: int):
+    return fetch_activities(persona_id)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_db_tasks(activity_id: int):
+    return fetch_tasks(activity_id)
+
+
+def score_cls(v: float) -> str:
+  if v is None:
+    return "score-na"
+  if v >= 8:
+    return "score-great"
+  if v >= 6:
+    return "score-good"
+  if v >= 4:
+    return "score-ok"
+  return "score-poor"
+
+
+def score_label(v: float) -> str:
+  if v is None:
+    return "Unavailable"
+  if v >= 8:
+    return "Strong"
+  if v >= 6:
+    return "Good"
+  if v >= 4:
+    return "Needs work"
+  return "Low"
+
+
 def metric_card(col, label, value):
-    col.markdown(f"""<div class="metric-card">
-      <div class="metric-value {score_cls(value)}">{value}</div>
-      <div class="metric-label">{label}</div></div>""", unsafe_allow_html=True)
+  display_value = "N/A" if value is None else value
+  col.markdown(
+    f"""<div class="metric-card">
+      <div class="metric-value {score_cls(value)}">{display_value}</div>
+      <div class="metric-label">{label}</div></div>""",
+    unsafe_allow_html=True,
+  )
+
+
+def render_step_card(step_label: str, title: str):
+  st.markdown(
+    f"""<div class="step-card">
+      <div class="step-label">{step_label}</div>
+      <div class="step-title"> {title}</div>
+    </div>""",
+    unsafe_allow_html=True,
+  )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 — Session Setup
+# STEP 0 — Persona / Activity / Task
 # ─────────────────────────────────────────────────────────────────────────────
-with st.expander("Step 1 — Session Setup (Persona & Prompt)", expanded=True):
-    c1, c2 = st.columns(2)
-    with c1:
-        selected_performer = st.selectbox("Performer Role (You)", [r.name for r in performer_roles], key="sel_p")
-        p_obj = persona_framework.get_role(selected_performer)
-        if p_obj: st.caption(f"{p_obj.requirements['description']}")
-    with c2:
-        selected_target = st.selectbox("Target Audience", [r.name for r in target_roles], key="sel_t")
-        t_obj = persona_framework.get_role(selected_target)
-        if t_obj:
-            st.caption(f"{t_obj.requirements['description']}")
-            exps = t_obj.requirements.get("expectations", [])
-            if exps: st.caption("Expects: "+ " • ".join(exps))
+with st.expander("Step 0 — Persona / Activity / Task", expanded=True):
+    st.markdown(
+        "This section loads persona, activity, and task options from the database. "
+        "Select a Persona first, then choose the related Activity and Task.",
+    )
+    st.markdown(
+        '<div class="section-heading">Select your Persona, Activity and Task</div>',
+        unsafe_allow_html=True,
+    )
+    db_error = None
+    db_personas = []
+    try:
+        db_personas = _load_db_personas()
+    except Exception as exc:
+        db_error = str(exc)
+
+    if db_error:
+        st.error("Could not load persona data from database: " + db_error)
+
+    if not db_personas:
+        st.info("No persona options were found in the database.")
+        selected_db_persona = None
+    else:
+        selected_db_persona = st.selectbox(
+            "Persona",
+            db_personas,
+            format_func=lambda item: item["name"],
+            key="db_persona",
+            help="Choose a persona from the database.",
+        )
+
+    db_activities = []
+    selected_db_activity = None
+    if selected_db_persona:
+        db_activities = _load_db_activities(selected_db_persona["id"])
+
+    if db_activities:
+        selected_db_activity = st.selectbox(
+            "Activity",
+            db_activities,
+            format_func=lambda item: item["activity_name"],
+            key="db_activity",
+            help="Choose an activity related to the selected persona.",
+        )
+        if selected_db_activity and selected_db_activity.get("description"):
+            st.caption(selected_db_activity["description"])
+    else:
+        st.info("No activities found for the selected persona.")
+
+    db_tasks = []
+    selected_db_task = None
+    if selected_db_activity:
+        db_tasks = _load_db_tasks(selected_db_activity["id"])
+
+    if db_tasks:
+        selected_db_task = st.selectbox(
+            "Task",
+            db_tasks,
+            format_func=lambda item: item["task_name"],
+            key="db_task",
+            help="Choose a task related to the selected activity.",
+        )
+        if selected_db_task and selected_db_task.get("description"):
+            st.caption(selected_db_task["description"])
+    else:
+        if selected_db_activity:
+            st.info("No tasks found for the selected activity.")
+
+    if selected_db_persona and selected_db_activity and selected_db_task:
+        st.success(
+            f"Selected scenario: {selected_db_persona['name']} → {selected_db_activity['activity_name']} "
+            f"→ {selected_db_task['task_name']}"
+        )
+        st.session_state["selected_db_task"] = {
+            "persona": selected_db_persona,
+            "activity": selected_db_activity,
+            "task": selected_db_task,
+        }
+
     prompt_input = st.text_area(
         "Prompt / Question",
         value="Introduce yourself and explain the value you bring to the customer.",
         height=72, key="prompt_input",
     )
 
+    selected_performer = selected_db_persona["name"] if selected_db_persona else "Unknown Performer"
+    selected_target = selected_db_activity["activity_name"] if selected_db_activity else "Unknown Target"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 2 — Record
+# STEP 1 — Record
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown("""<div class="step-card">
-  <div class="step-label">Step 2</div>
-  <div class="step-title"> Record Your Session</div>
-</div>""", unsafe_allow_html=True)
+render_step_card("Step 1", "Record Your Session")
 
 st.markdown(f"""<div class="rec-launch">
   <a class="rec-btn-link" href="http://localhost:{RECORDER_PORT}" target="_blank">
@@ -474,12 +905,9 @@ st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 3 — Check status + Analyse
+# STEP 2 — Check status + Analyse
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown("""<div class="step-card">
-  <div class="step-label">Step 3</div>
-  <div class="step-title"> Analyse Session</div>
-</div>""", unsafe_allow_html=True)
+render_step_card("Step 2", "Analyse Session")
 
 # Detect recording
 def _check_recording():
@@ -573,10 +1001,7 @@ if "results" in st.session_state:
     enh_prompt    = results.get("enhanced_prompt", st.session_state.get("res_prompt", ""))
 
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
-    st.markdown("""<div class="step-card">
-      <div class="step-label">Step 4</div>
-      <div class="step-title">Your Session Scorecard</div>
-    </div>""", unsafe_allow_html=True)
+    render_step_card("Step 4", "Your Session Scorecard")
 
     cx1, cx2, cx3 = st.columns(3)
     cx1.markdown(f"**Performer:** {st.session_state.get('res_performer','—')}")
@@ -598,6 +1023,11 @@ if "results" in st.session_state:
     metric_card(sc2, "Audio",    scores.get("audio_performance_score", 0))
     metric_card(sc3, "Text",      scores.get("text_performance_score", 0))
     metric_card(sc4, "Relevance", scores.get("relevance_score", 0))
+    if scores.get("video_analysis_available") is False:
+        st.info(
+            "Video analysis was unavailable for this recording: "
+            + (scores.get("video_analysis_status") or "no visual landmarks were detected.")
+        )
     st.markdown("<br>", unsafe_allow_html=True)
 
     tab_ov, tab_vid, tab_aud, tab_txt = st.tabs(
@@ -611,19 +1041,26 @@ if "results" in st.session_state:
             import pandas as pd, altair as alt
             df = pd.DataFrame({
                 "Dimension": ["Video","Audio","Text","Relevance"],
-                "Score": [scores.get("visual_performance_score",0), scores.get("audio_performance_score",0),
-                          scores.get("text_performance_score",0), scores.get("relevance_score",0)],
+                "Score": [
+                    scores.get("visual_performance_score",0),
+                    scores.get("audio_performance_score",0),
+                    scores.get("text_performance_score",0),
+                    scores.get("relevance_score",0),
+                ],
             })
             chart = (alt.Chart(df).mark_bar(cornerRadiusTopLeft=6,cornerRadiusTopRight=6)
                 .encode(
-                    x=alt.X("Dimension:N",sort=None,axis=alt.Axis(labelColor="#8b949e",labelFontSize=13)),
-                    y=alt.Y("Score:Q",scale=alt.Scale(domain=[0,10]),axis=alt.Axis(labelColor="#8b949e")),
-                    color=alt.Color("Score:Q",scale=alt.Scale(domain=[0,5,8,10],
-                                    range=["#f43f5e","#f59e0b","#4f8ef7","#10b981"]),legend=None),
+                    x=alt.X("Dimension:N", sort=None,
+                            axis=alt.Axis(labelColor="#4b5563", labelFontSize=13, labelFontWeight="bold")),
+                    y=alt.Y("Score:Q", scale=alt.Scale(domain=[0,10]),
+                            axis=alt.Axis(labelColor="#8b949e")),
+                    color=alt.Color("Score:Q", scale=alt.Scale(
+                        domain=[0,5,8,10],
+                        range=["#f43f5e","#f59e0b","#4f8ef7","#10b981"]), legend=None),
                     tooltip=["Dimension","Score"])
-                .properties(height=220)
-                .configure_view(strokeWidth=0,fill="#00000000")
-                .configure_axis(grid=False,domain=False))
+                .properties(height=240)
+                .configure_view(strokeWidth=0, fill="#00000000")
+                .configure_axis(grid=False, domain=False))
             st.altair_chart(chart, use_container_width=True)
         except Exception:
             for d,v in zip(["Video","Audio","Text","Relevance"],
@@ -634,22 +1071,39 @@ if "results" in st.session_state:
         with st.expander("Full Transcript", expanded=False):
             st.markdown(f"_{transcript or 'No transcript available.'}_")
 
-        strengths, gaps = [], []
-        for lbl, key in [("Video body language","visual_performance_score"),
-                         ("Audio delivery","audio_performance_score"),
-                         ("Text quality","text_performance_score"),
-                         ("Prompt relevance","relevance_score")]:
-            v = scores.get(key, 0)
-            if v >= 7: strengths.append(f"{score_label(v)} {lbl} ({v}/10)")
-            elif v < 5: gaps.append(f"{score_label(v)} {lbl} ({v}/10)")
+        # Always categorise all 4 dimensions into strengths / needs work / gaps
+        dim_scores = [
+            ("Video body language",  "visual_performance_score"),
+            ("Audio delivery",       "audio_performance_score"),
+            ("Text quality",         "text_performance_score"),
+            ("Prompt relevance",     "relevance_score"),
+        ]
+        strengths, mid, gaps = [], [], []
+        for lbl, key in dim_scores:
+            v = scores.get(key)
+            if v is None:
+                continue
+            entry = f"{score_label(v)} {lbl} ({v}/10)"
+            if v >= 7:
+                strengths.append(entry)
+            elif v < 5:
+                gaps.append(entry)
+            else:
+                mid.append(entry)
 
         ga, gb = st.columns(2)
         with ga:
             st.markdown("#### Strengths")
-            for s in (strengths or ["Keep practising to build strengths!"]): st.markdown(f"- {s}")
+            for s in (strengths or ["Keep practising to build strengths!"]):
+                st.markdown(f"- {s}")
+            if mid:
+                st.markdown("#### Developing")
+                for m in mid:
+                    st.markdown(f"- {m}")
         with gb:
             st.markdown("#### Areas to Improve")
-            for g in (gaps or ["No major gaps — great session!"]): st.markdown(f"- {g}")
+            for g in (gaps or ["No major gaps — great session!"]):
+                st.markdown(f"- {g}")
 
     # ── Video ─────────────────────────────────────────────────────────────────
     with tab_vid:
@@ -659,49 +1113,93 @@ if "results" in st.session_state:
         metric_card(v2,"Eye Contact",   scores.get("eye_contact_score",0))
         metric_card(v3,"Expression",    scores.get("expression_score",0))
         metric_card(v4,"Head Stability",scores.get("head_stability_score",0))
+
         if body_llm:
-            st.markdown(f"<br>**Overall:** {body_llm.get('overall_body_language','—')}", unsafe_allow_html=True)
-            if (interp := body_llm.get("body_language_interpretation","")): st.info(f"{interp}")
-            ba,bb,bc = st.columns(3)
-            with ba: st.markdown("**Posture**"); st.caption(body_llm.get("posture_analysis","—"))
-            with bb: st.markdown("**Eye Contact**"); st.caption(body_llm.get("eye_contact_analysis","—"))
-            with bc: st.markdown("**Expression**"); st.caption(body_llm.get("expression_analysis","—"))
-            if (sugg := body_llm.get("improvement_suggestions","")): st.warning(f"{sugg}")
+            overall_bl = body_llm.get("overall_body_language","")
+            if overall_bl:
+                st.markdown(f"<br>**Overall:** {overall_bl}", unsafe_allow_html=True)
+            interp = body_llm.get("body_language_interpretation","")
+            if interp:
+                st.info(f"{interp}")
+
+            # 3-column detailed analysis (always shown when data exists)
+            ba, bb, bc = st.columns(3)
+            posture_txt    = body_llm.get("posture_analysis","—")
+            eyect_txt      = body_llm.get("eye_contact_analysis","—")
+            expr_txt       = body_llm.get("expression_analysis","—")
+            with ba:
+                st.markdown("**Posture**")
+                st.caption(posture_txt)
+            with bb:
+                st.markdown("**Eye Contact**")
+                st.caption(eyect_txt)
+            with bc:
+                st.markdown("**Expression**")
+                st.caption(expr_txt)
+
+            sugg = body_llm.get("improvement_suggestions","")
+            if sugg:
+                st.warning(f"{sugg}")
+        else:
+            st.info("Body language interpretation unavailable for this recording.")
+
         st.markdown("#### Coaching Tips")
         for lbl, key, bad, good in [
-            ("Posture","posture_score","Sit upright — shoulders back, spine tall.","Great posture!"),
-            ("Eye Contact","eye_contact_score","Look at the camera lens, not the screen.","Excellent gaze!"),
-            ("Expression","expression_score","Vary expressions — appear engaged and warm.","Good facial engagement!"),
-            ("Head Stability","head_stability_score","Minimise excessive head movement.","Steady and composed!"),
+            ("Posture",        "posture_score",        "Sit upright — shoulders back, spine tall.",          "Great posture!"),
+            ("Eye Contact",    "eye_contact_score",    "Look at the camera lens, not the screen.",           "Excellent gaze!"),
+            ("Expression",     "expression_score",     "Vary expressions — appear engaged and warm.",        "Good facial engagement!"),
+            ("Head Stability", "head_stability_score", "Minimise excessive head movement.",                  "Steady and composed!"),
         ]:
             v = scores.get(key, 5)
-            (st.warning if v < 6 else st.success)(f"{lbl}: {bad if v < 6 else good}")
+            if v is None:
+                st.info(f"{lbl}: visual analysis unavailable for this recording.")
+            else:
+                (st.warning if v < 6 else st.success)(f"{lbl}: {bad if v < 6 else good}")
 
     # ── Audio ─────────────────────────────────────────────────────────────────
     with tab_aud:
         st.markdown("### Audio & Speech Analysis")
         a1,a2,a3 = st.columns(3)
-        metric_card(a1,"Clarity",      scores.get("speech_clarity_score",0))
+        metric_card(a1,"Clarity",       scores.get("speech_clarity_score",0))
         metric_card(a2,"Confidence",    scores.get("confidence_score",0))
         metric_card(a3,"Communication", scores.get("communication_score",0))
+
         st.markdown("<br>#### Speech Signal Metrics", unsafe_allow_html=True)
         sm1,sm2,sm3,sm4 = st.columns(4)
         sm1.metric("WPM",           audio_metrics.get("wpm","—"))
         sm2.metric("Filler Score",  audio_metrics.get("filler_score","—"))
         sm3.metric("Pause Rate",    audio_metrics.get("pause_rate","—"))
         sm4.metric("Silence Ratio", audio_signal.get("silence_ratio","—"))
-        with st.expander("Interpretation Details"):
-            for k,l in [("wpm_interpretation","WPM"),("filler_interpretation","Filler"),("pause_interpretation","Pause")]:
-                if (v := audio_metrics.get(k,"—")) != "—": st.markdown(f"**{l}:** {v}")
-            for k,l in [("energy_interpretation","Energy"),("pitch_interpretation","Pitch"),("silence_interpretation","Silence")]:
-                if (v := audio_signal.get(k,"—")) != "—": st.markdown(f"**{l}:** {v}")
+
+        # Interpretation details always shown (no expander)
+        interp_lines = []
+        for k, l in [("wpm_interpretation","WPM"), ("filler_interpretation","Filler"), ("pause_interpretation","Pause")]:
+            v = audio_metrics.get(k,"")
+            if v and v != "—":
+                interp_lines.append(f"**{l}:** {v}")
+        for k, l in [("energy_interpretation","Energy"), ("pitch_interpretation","Pitch"), ("silence_interpretation","Silence")]:
+            v = audio_signal.get(k,"")
+            if v and v != "—":
+                interp_lines.append(f"**{l}:** {v}")
+        if interp_lines:
+            with st.expander("Interpretation Details", expanded=True):
+                for line in interp_lines:
+                    st.markdown(f"- {line}")
+
         if audio_llm:
             st.markdown("#### LLM Feedback")
-            for key,label in [("tone_quality","Tone"),("voice_quality_feedback","Voice"),
-                               ("engagement_level","Engagement"),("communication_style","Style"),
-                               ("language_fluency","Fluency"),("professionalism_level","Professionalism"),
-                               ("filler_word_usage","Fillers")]:
-                if (v := audio_llm.get(key,"")): st.markdown(f"**{label}:** {v}")
+            for key, label in [
+                ("tone_quality",          "Tone"),
+                ("voice_quality_feedback","Voice"),
+                ("engagement_level",      "Engagement"),
+                ("communication_style",   "Style"),
+                ("language_fluency",      "Fluency"),
+                ("professionalism_level", "Professionalism"),
+                ("filler_word_usage",     "Fillers"),
+            ]:
+                v = audio_llm.get(key,"")
+                if v:
+                    st.markdown(f"**{label}:** {v}")
 
     # ── Text & Relevance ──────────────────────────────────────────────────────
     with tab_txt:
@@ -709,13 +1207,16 @@ if "results" in st.session_state:
         tr1,tr2 = st.columns(2)
         metric_card(tr1,"Text Quality", scores.get("text_performance_score",0))
         metric_card(tr2,"Relevance",    scores.get("relevance_score",0))
+
         st.markdown("<br>#### Grammar & Fluency", unsafe_allow_html=True)
         tm1,tm2 = st.columns(2)
         tm1.metric("Grammar Errors", text_result.get("error_count","—"))
         tm2.metric("Filler Words",   text_result.get("filler_count","—"))
+
         if (fb := text_result.get("feedback","")):
             t_sc = scores.get("text_performance_score",5)
             (st.success if t_sc>=8 else st.info if t_sc>=6 else st.warning)(f"**Evaluator:** {fb}")
+
         det_langs = text_result.get("detected_languages") or results.get("detected_languages", [])
         if det_langs and det_langs != ["unknown"]:
             st.markdown("**Languages:** " + ", ".join(f"**{l}**" for l in det_langs))
@@ -731,17 +1232,31 @@ if "results" in st.session_state:
         rel_label   = scores.get("relevance_label","")
         rel_reason  = scores.get("relevance_reason","")
         rel_deducts = scores.get("relevance_deductions",[])
-        tag_map = {"relevant":'<span class="tag-pill tag-relevant"> Relevant</span>',
-                   "partially_relevant":'<span class="tag-pill tag-partial"> Partially Relevant</span>',
-                   "irrelevant":'<span class="tag-pill tag-irrelevant"> Irrelevant</span>'}
-        st.markdown(f"**Status:** {tag_map.get(rel_label, rel_label)}", unsafe_allow_html=True)
-        with st.expander("Prompt evaluated against", expanded=False): st.info(enh_prompt)
+
+        tag_map = {
+            "relevant":          '<span class="tag-pill tag-relevant">✓ Relevant</span>',
+            "partially_relevant":'<span class="tag-pill tag-partial">◑ Partially Relevant</span>',
+            "irrelevant":        '<span class="tag-pill tag-irrelevant">✗ Irrelevant</span>',
+        }
+        # Fallback: wrap any unknown label in a styled pill too
+        rel_display = tag_map.get(
+            rel_label,
+            f'<span class="tag-pill tag-irrelevant">{rel_label.replace("_"," ").title() if rel_label else "Unknown"}</span>'
+        )
+        st.markdown(f"**Status:** {rel_display}", unsafe_allow_html=True)
+
+        with st.expander("Prompt evaluated against", expanded=False):
+            st.info(enh_prompt)
+
         r_sc = scores.get("relevance_score",0)
         if rel_reason:
             (st.success if r_sc>=8 else st.info if r_sc>=5 else st.warning)(f"**Evaluator:** {rel_reason}")
+
+        # Deductions always visible (expanded) when score is low
         if rel_deducts:
-            with st.expander("Deductions Applied", expanded=r_sc<6):
-                for d in rel_deducts: st.markdown(f"- {d}")
+            with st.expander("Deductions Applied", expanded=True):
+                for d in rel_deducts:
+                    st.markdown(f"- {d}")
 
         st.markdown("#### How to Improve Relevance")
         t_role = persona_framework.get_role(st.session_state.get("res_target",""))
@@ -750,18 +1265,25 @@ if "results" in st.session_state:
         else:
             tips = []
             if r_sc < 4:
-                tips += ["**Re-read the prompt** — identify the core question before answering.",
-                         "**Open with a direct statement** addressing what was asked.",
-                         "**Avoid long preambles** — make your point within 2 sentences."]
+                tips += [
+                    "**Re-read the prompt** — identify the core question before answering.",
+                    "**Open with a direct statement** addressing what was asked.",
+                    "**Avoid long preambles** — make your point within 2 sentences.",
+                ]
             elif r_sc < 6:
-                tips += ["**Stay closer to the scenario** described in the prompt.",
-                         "**Reduce tangents** — consciously redirect back to the topic."]
+                tips += [
+                    "**Stay closer to the scenario** described in the prompt.",
+                    "**Reduce tangents** — consciously redirect back to the topic.",
+                ]
             else:
                 tips += ["**Add specifics** — concrete examples or numbers."]
+
             if t_role:
                 exps = t_role.requirements.get("expectations",[])
                 if exps:
                     tips.append(f"**Speak to *{t_role.name}*'s expectations:**")
-                    tips += [f"- {e}" for e in exps]
+                    tips += [f"  - {e}" for e in exps]
+
             tips.append("**Use PREP:** Point → Reason → Example → Point (restate).")
-            for tip in tips: st.markdown(f"- {tip}")
+            for tip in tips:
+                st.markdown(f"- {tip}")

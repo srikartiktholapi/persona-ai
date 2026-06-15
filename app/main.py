@@ -21,6 +21,7 @@ import uuid
 import time
 import requests
 from fastapi import Body
+from app.frontend_formatter import format_for_frontend
 from app.agents.video import analyze_video
 from app.agents.audio import process_audio
 from app.agents.scoring import (
@@ -125,7 +126,7 @@ async def start_analysis(file: UploadFile = File(...)):
     final_total = body_val + audio_val + relevance_val
     overall = f"{final_total}/100"
 
-    return {
+    raw_result = {
         "status": "success",
         "filename": file.filename,
         "results": {
@@ -142,21 +143,19 @@ async def start_analysis(file: UploadFile = File(...)):
                 "body_score": f"{body_val}/20",
                 "audio_score": f"{audio_val}/30",
                 "relevance_score": f"{relevance_val}/50"
-},
+            },
             "transcript": audio_data["full_transcript"]
         },
-
-        # 🔥 COMPLETE TIMING
         "timing": {
             "body_language_time_sec": body_time,
             "audio_pipeline_time_sec": audio_time,
             "ai_scoring_time_sec": ai_time,
             "total_time_sec": total_time
         },
-
-        # 🔥 DEEP AUDIO TIMING
         "audio_timing_breakdown": audio_data.get("timing")
     }
+
+    return format_for_frontend(raw_result)
 @app.post("/analyze-url")
 async def start_analysis_from_url(payload: dict = Body(...)):
     """
@@ -190,7 +189,7 @@ async def start_analysis_from_url(payload: dict = Body(...)):
             os.getenv("OPENAI_API_KEY")
         )
 
-        return {
+        raw_result = {
             "status": "success",
             "source": "url",
             "video_url": video_url,
@@ -200,6 +199,8 @@ async def start_analysis_from_url(payload: dict = Body(...)):
                 "transcript": audio_data["full_transcript"]
             }
         }
+
+        return format_for_frontend(raw_result)
 
     except Exception as e:
         return {

@@ -2,13 +2,33 @@ from app.orchestrator.state import AgentState
 import cv2
 import pandas as pd
 import mediapipe as mp
-import cv2
-import pandas as pd
-import mediapipe as mp
-
-mp_holistic = mp.solutions.holistic
+import pathlib
+import requests
 
 from collections import deque
+
+try:
+    mp_holistic = mp.solutions.holistic
+except AttributeError:
+    mp_holistic = None
+
+try:
+    from mediapipe.tasks.python import BaseOptions, vision
+except Exception:
+    BaseOptions = None
+    vision = None
+
+POSE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+FACE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
+MODEL_DIR = pathlib.Path(__file__).resolve().parents[2] / "models" / "mediapipe"
+POSE_MODEL_PATH = MODEL_DIR / "pose_landmarker_lite.task"
+FACE_MODEL_PATH = MODEL_DIR / "face_landmarker.task"
+
+POSE_NOSE = 0
+POSE_LEFT_SHOULDER = 11
+POSE_RIGHT_SHOULDER = 12
+POSE_LEFT_HIP = 23
+POSE_RIGHT_HIP = 24
 
 # Add a simple temporal smoothing buffer for scores
 SCORE_SMOOTHING_WINDOW = 5
@@ -23,6 +43,17 @@ def process(state: AgentState) -> dict:
     features = state.get("recent_video_features", [])
     if not features or "raw_frames" not in features[0]:
         return {}
+
+    if mp_holistic is None:
+        return {
+            "recent_video_features": [],
+            "scores": {
+                "visual_performance_score": 0.0,
+                "posture_score": 0.0,
+                "eye_contact_score": 0.0,
+                "expression_score": 0.0,
+            },
+        }
         
     frames = features[0]["raw_frames"]
     
@@ -82,11 +113,11 @@ def calculate_posture_score(landmarks):
     Earns bonuses for good indicators, penalties for bad ones.
     This prevents the 'always 9+' issue of the penalty-only model.
     """
-    ls        = landmarks[mp_holistic.PoseLandmark.LEFT_SHOULDER.value]
-    rs        = landmarks[mp_holistic.PoseLandmark.RIGHT_SHOULDER.value]
-    left_hip  = landmarks[mp_holistic.PoseLandmark.LEFT_HIP.value]
-    right_hip = landmarks[mp_holistic.PoseLandmark.RIGHT_HIP.value]
-    nose      = landmarks[mp_holistic.PoseLandmark.NOSE.value]
+    ls        = landmarks[POSE_LEFT_SHOULDER]
+    rs        = landmarks[POSE_RIGHT_SHOULDER]
+    left_hip  = landmarks[POSE_LEFT_HIP]
+    right_hip = landmarks[POSE_RIGHT_HIP]
+    nose      = landmarks[POSE_NOSE]
 
     score = 5.0  # neutral/average baseline
 
@@ -196,6 +227,297 @@ def calculate_eye_contact(face):
     return score
 
 
+def _ensure_mediapipe_model(path: pathlib.Path, url: str):
+    if path.exists() and path.stat().st_size > 0:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with requests.get(url, stream=True, timeout=60) as response:
+        response.raise_for_status()
+        with open(path, "wb") as model_file:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    model_file.write(chunk)
+
+
+def _create_tasks_landmarkers():
+    if BaseOptions is None or vision is None:
+        raise RuntimeError("MediaPipe Tasks vision API is unavailable.")
+
+    _ensure_mediapipe_model(POSE_MODEL_PATH, POSE_MODEL_URL)
+    _ensure_mediapipe_model(FACE_MODEL_PATH, FACE_MODEL_URL)
+
+    pose_options = vision.PoseLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=str(POSE_MODEL_PATH)),
+        running_mode=vision.RunningMode.IMAGE,
+        num_poses=1,
+        min_pose_detection_confidence=0.45,
+        min_pose_presence_confidence=0.45,
+        min_tracking_confidence=0.45,
+    )
+    face_options = vision.FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=str(FACE_MODEL_PATH)),
+        running_mode=vision.RunningMode.IMAGE,
+        num_faces=1,
+        min_face_detection_confidence=0.45,
+        min_face_presence_confidence=0.45,
+        min_tracking_confidence=0.45,
+    )
+    return (
+        vision.PoseLandmarker.create_from_options(pose_options),
+        vision.FaceLandmarker.create_from_options(face_options),
+    )
+
+
+def analyze_video_with_mediapipe_tasks(video_path):
+    posture_vals = []
+    expr_vals = []
+    eye_vals = []
+    head_movement_vals = []
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        cap.release()
+        return {
+            "video_analysis_available": False,
+            "video_analysis_status": "Video file could not be opened for MediaPipe visual analysis.",
+            "posture_score": None,
+            "eye_contact_score": None,
+            "expression_score": None,
+            "head_stability": None,
+            "body_language_score": None,
+        }
+
+    try:
+        pose_landmarker, face_landmarker = _create_tasks_landmarkers()
+    except Exception as exc:
+        cap.release()
+        return {
+            "video_analysis_available": False,
+            "video_analysis_status": f"MediaPipe Tasks could not start: {exc}",
+            "posture_score": None,
+            "eye_contact_score": None,
+            "expression_score": None,
+            "head_stability": None,
+            "body_language_score": None,
+        }
+
+    prev_nose_x = None
+    sampled_frames = 0
+    landmark_frames = 0
+
+    try:
+        frame_count = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame_count += 1
+            if frame_count % 3 != 0:
+                continue
+
+            sampled_frames += 1
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+            pose_result = pose_landmarker.detect(image)
+            face_result = face_landmarker.detect(image)
+
+            if pose_result.pose_landmarks:
+                landmark_frames += 1
+                pose = pose_result.pose_landmarks[0]
+                posture_vals.append(calculate_posture_score(pose))
+
+                nose = pose[POSE_NOSE]
+                if prev_nose_x is not None:
+                    movement = abs(nose.x - prev_nose_x)
+                    head_movement_vals.append(max(0, min(10, 10 - movement * 60)))
+                prev_nose_x = nose.x
+
+            if face_result.face_landmarks:
+                landmark_frames += 1
+                face = face_result.face_landmarks[0]
+                expr_vals.append(calculate_expression_score(face))
+                eye_vals.append(calculate_eye_contact(face))
+            else:
+                expr_vals.append(5.0)
+                eye_vals.append(5.0)
+    finally:
+        cap.release()
+        pose_landmarker.close()
+        face_landmarker.close()
+
+    if landmark_frames == 0:
+        return {
+            "video_analysis_available": False,
+            "video_analysis_status": f"MediaPipe detected no face or body landmarks in {sampled_frames} sampled frames.",
+            "posture_score": None,
+            "eye_contact_score": None,
+            "expression_score": None,
+            "head_stability": None,
+            "body_language_score": None,
+        }
+
+    posture_mean = pd.Series(posture_vals).mean() if posture_vals else 5.0
+    expr_mean = pd.Series(expr_vals).mean() if expr_vals else 5.0
+    eye_mean = pd.Series(eye_vals).mean() if eye_vals else 5.0
+    head_mean = pd.Series(head_movement_vals).mean() if head_movement_vals else 5.0
+
+    body_score = (
+        0.30 * posture_mean +
+        0.25 * eye_mean +
+        0.20 * head_mean +
+        0.15 * expr_mean +
+        0.10 * posture_mean
+    )
+
+    return {
+        "video_analysis_available": True,
+        "video_analysis_status": "Visual analysis completed using MediaPipe Tasks.",
+        "video_analysis_method": "mediapipe_tasks",
+        "sampled_frames": sampled_frames,
+        "landmark_frames": landmark_frames,
+        "posture_score": round(posture_mean, 2),
+        "eye_contact_score": round(eye_mean, 2),
+        "expression_score": round(expr_mean, 2),
+        "head_stability": round(head_mean, 2),
+        "body_language_score": round(body_score, 2)
+    }
+
+
+def analyze_video_with_opencv_fallback(video_path):
+    """
+    Fallback visual analysis for environments where MediaPipe solutions are
+    unavailable. It uses OpenCV face detection to estimate framing, gaze
+    direction, and head stability, so good videos do not collapse to 0.0.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        cap.release()
+        return {
+            "video_analysis_available": False,
+            "video_analysis_status": "Video file could not be opened for visual analysis.",
+            "posture_score": None,
+            "eye_contact_score": None,
+            "expression_score": None,
+            "head_stability": None,
+            "body_language_score": None,
+        }
+
+    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    face_detector = cv2.CascadeClassifier(cascade_path)
+    if face_detector.empty():
+        cap.release()
+        return {
+            "video_analysis_available": False,
+            "video_analysis_status": "OpenCV face detector could not be loaded.",
+            "posture_score": None,
+            "eye_contact_score": None,
+            "expression_score": None,
+            "head_stability": None,
+            "body_language_score": None,
+        }
+
+    posture_vals = []
+    eye_vals = []
+    expression_vals = []
+    centers = []
+    frame_count = 0
+    processed_frames = 0
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_count += 1
+        if frame_count % 5 != 0:
+            continue
+
+        processed_frames += 1
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_detector.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(60, 60),
+        )
+        if len(faces) == 0:
+            continue
+
+        h, w = frame.shape[:2]
+        x, y, fw, fh = max(faces, key=lambda box: box[2] * box[3])
+        cx = (x + fw / 2) / max(w, 1)
+        cy = (y + fh / 2) / max(h, 1)
+        face_ratio = fw / max(w, 1)
+        centers.append((cx, cy))
+
+        # Camera-facing proxy: a centered face usually means the speaker is
+        # facing the camera. This is intentionally conservative.
+        horizontal_dev = abs(cx - 0.5)
+        eye_vals.append(max(3.0, min(10.0, 10.0 - horizontal_dev * 18.0)))
+
+        # Framing/posture proxy: good score when the face is centered and not
+        # extremely close or far from the camera.
+        posture = 7.0
+        posture -= min(3.0, abs(cy - 0.36) * 10.0)
+        if face_ratio < 0.14:
+            posture -= 1.5
+        elif face_ratio > 0.42:
+            posture -= 1.2
+        else:
+            posture += 0.8
+        posture_vals.append(max(3.0, min(10.0, posture)))
+
+        # Haar cascades cannot read expression reliably, so use a neutral
+        # baseline rather than punishing the candidate.
+        expression_vals.append(6.0)
+
+    cap.release()
+
+    if not centers:
+        return {
+            "video_analysis_available": False,
+            "video_analysis_status": (
+                f"No frontal face was detected in {processed_frames} sampled frames."
+            ),
+            "posture_score": None,
+            "eye_contact_score": None,
+            "expression_score": None,
+            "head_stability": None,
+            "body_language_score": None,
+        }
+
+    if len(centers) > 1:
+        movement_vals = [
+            abs(centers[idx][0] - centers[idx - 1][0]) + abs(centers[idx][1] - centers[idx - 1][1])
+            for idx in range(1, len(centers))
+        ]
+        avg_movement = pd.Series(movement_vals).mean()
+        head_mean = max(3.0, min(10.0, 10.0 - avg_movement * 30.0))
+    else:
+        head_mean = 6.0
+
+    posture_mean = pd.Series(posture_vals).mean()
+    eye_mean = pd.Series(eye_vals).mean()
+    expr_mean = pd.Series(expression_vals).mean()
+    body_score = round(
+        0.35 * posture_mean + 0.30 * eye_mean + 0.20 * expr_mean + 0.15 * head_mean,
+        2,
+    )
+
+    return {
+        "video_analysis_available": True,
+        "video_analysis_status": "Visual analysis completed using OpenCV fallback.",
+        "video_analysis_method": "opencv_fallback",
+        "posture_score": round(posture_mean, 2),
+        "eye_contact_score": round(eye_mean, 2),
+        "expression_score": round(expr_mean, 2),
+        "head_stability": round(head_mean, 2),
+        "body_language_score": body_score,
+    }
+
+
 def analyze_video(video_path):
 
     posture_vals = []
@@ -205,7 +527,24 @@ def analyze_video(video_path):
 
     cap = cv2.VideoCapture(video_path)
 
+    if mp_holistic is None:
+        cap.release()
+        return analyze_video_with_mediapipe_tasks(video_path)
+
+    if not cap.isOpened():
+        cap.release()
+        return {
+            "video_analysis_available": False,
+            "video_analysis_status": "Video file could not be opened for visual analysis.",
+            "posture_score": None,
+            "eye_contact_score": None,
+            "expression_score": None,
+            "head_stability": None,
+            "body_language_score": None,
+        }
+
     prev_nose_x = None
+    landmark_frames = 0
 
     with mp_holistic.Holistic(
         min_detection_confidence=0.5,
@@ -233,6 +572,7 @@ def analyze_video(video_path):
             results = holistic.process(rgb)
 
             if results.pose_landmarks:
+                landmark_frames += 1
 
                 posture_vals.append(
                     calculate_posture_score(
@@ -240,9 +580,7 @@ def analyze_video(video_path):
                     )
                 )
 
-                nose = results.pose_landmarks.landmark[
-                    mp_holistic.PoseLandmark.NOSE.value
-                ]
+                nose = results.pose_landmarks.landmark[POSE_NOSE]
 
                 if prev_nose_x is not None:
 
@@ -255,6 +593,7 @@ def analyze_video(video_path):
                 prev_nose_x = nose.x
 
             if results.face_landmarks:
+                landmark_frames += 1
 
                 expr_vals.append(
                     calculate_expression_score(
@@ -275,9 +614,20 @@ def analyze_video(video_path):
 
     cap.release()
 
-    posture_mean = pd.Series(posture_vals).mean()
-    expr_mean = pd.Series(expr_vals).mean()
-    eye_mean = pd.Series(eye_vals).mean()
+    if landmark_frames == 0:
+        return {
+            "video_analysis_available": False,
+            "video_analysis_status": "No face or body landmarks were detected in the recording.",
+            "posture_score": None,
+            "eye_contact_score": None,
+            "expression_score": None,
+            "head_stability": None,
+            "body_language_score": None,
+        }
+
+    posture_mean = pd.Series(posture_vals).mean() if posture_vals else 5.0
+    expr_mean = pd.Series(expr_vals).mean() if expr_vals else 5.0
+    eye_mean = pd.Series(eye_vals).mean() if eye_vals else 5.0
 
     if head_movement_vals:
         head_mean = pd.Series(head_movement_vals).mean()
@@ -293,6 +643,8 @@ def analyze_video(video_path):
     )
 
     return {
+        "video_analysis_available": True,
+        "video_analysis_status": "Visual analysis completed.",
         "posture_score": round(posture_mean, 2),
         "eye_contact_score": round(eye_mean, 2),
         "expression_score": round(expr_mean, 2),
