@@ -150,7 +150,7 @@ def process(state: AgentState) -> dict:
             scores["noise_detected"] = True
         elif snr_db < 10:
             # Moderate noise â€” small penalty
-            score -= 1.0
+            score -= 1.0 
             scores["noise_detected"] = True
         else:
             scores["noise_detected"] = False
@@ -190,11 +190,8 @@ def calculate_audio_metrics(transcript, duration_sec, silence_ratio=None):
 
     filler_count = sum(len(re.findall(p, text)) for p in patterns)
 
-    filler_score = (
-        filler_count / word_count if word_count else 0
-    )
-
-    filler_score = round(filler_score, 3)
+    filler_ratio = filler_count / word_count if word_count else 0
+    filler_score = round(filler_ratio, 3)
 
     # -----------------------------
     # 3. Pause (USE AUDIO SIGNAL)
@@ -205,38 +202,45 @@ def calculate_audio_metrics(transcript, duration_sec, silence_ratio=None):
     # 4. Interpretations
     # -----------------------------
 
-    if wpm < 100:
-        wpm_interp = "Speech pace is slow and may sound hesitant."
+    if word_count == 0:
+        wpm_interp = "No spoken words were detected, so speech pace could not be evaluated."
+    elif wpm < 100:
+        wpm_interp = f"Measured pace is {wpm} WPM, which is slow and may sound hesitant."
     elif wpm < 130:
-        wpm_interp = "Speech pace is slightly slow but understandable."
+        wpm_interp = f"Measured pace is {wpm} WPM, slightly slow but understandable."
     elif wpm <= 170:
-        wpm_interp = "Speech pace is ideal for professional communication."
+        wpm_interp = f"Measured pace is {wpm} WPM, ideal for professional communication."
     elif wpm <= 190:
-        wpm_interp = "Speech pace is slightly fast but still understandable."
+        wpm_interp = f"Measured pace is {wpm} WPM, slightly fast but still understandable."
     else:
-        wpm_interp = "Speech pace is too fast and may affect clarity."
+        wpm_interp = f"Measured pace is {wpm} WPM, too fast and may affect clarity."
 
-    if filler_score < 0.02:
-        filler_interp = "Minimal hesitation with fluent speech."
+    filler_pct = round(filler_score * 100, 1)
+    if word_count == 0:
+        filler_interp = "No transcript words were available for filler-word analysis."
+    elif filler_score < 0.02:
+        filler_interp = f"Detected {filler_count} filler pattern(s), {filler_pct}% of words, showing minimal hesitation."
     elif filler_score < 0.05:
-        filler_interp = "Some hesitation present but acceptable."
+        filler_interp = f"Detected {filler_count} filler pattern(s), {filler_pct}% of words, so hesitation is present but acceptable."
     elif filler_score < 0.1:
-        filler_interp = "Noticeable hesitation affecting fluency."
+        filler_interp = f"Detected {filler_count} filler pattern(s), {filler_pct}% of words, which noticeably affects fluency."
     else:
-        filler_interp = "High hesitation and disfluency detected."
+        filler_interp = f"Detected {filler_count} filler pattern(s), {filler_pct}% of words, indicating high hesitation."
 
+    pause_pct = round(pause_rate * 100, 1)
     if pause_rate < 0.15:
-        pause_interp = "Smooth speech with minimal pauses."
+        pause_interp = f"Pause rate is {pause_pct}%, indicating smooth speech with minimal pauses."
     elif pause_rate < 0.3:
-        pause_interp = "Moderate pauses observed."
+        pause_interp = f"Pause rate is {pause_pct}%, so moderate pauses were observed."
     else:
-        pause_interp = "Frequent pauses indicating hesitation."
+        pause_interp = f"Pause rate is {pause_pct}%, indicating frequent pauses and possible hesitation."
 
     return {
         "wpm": wpm,
         "wpm_interpretation": wpm_interp,
 
         "filler_score": filler_score,
+        "filler_count": filler_count,
         "filler_interpretation": filler_interp,
 
         "pause_rate": round(pause_rate, 3),
@@ -252,12 +256,13 @@ def analyze_audio_signal(audio_path):
     energy = librosa.feature.rms(y=y)[0]
     avg_energy = float(np.mean(energy))
 
+    energy_value = round(avg_energy, 4)
     if avg_energy < 0.02:
-        energy_interp = "Low vocal energy indicating weak or monotone speech."
+        energy_interp = f"Voice energy is {energy_value}, which is low and may sound weak or monotone."
     elif avg_energy < 0.05:
-        energy_interp = "Moderate vocal energy suggesting steady speech delivery."
+        energy_interp = f"Voice energy is {energy_value}, suggesting steady speech delivery."
     else:
-        energy_interp = "High vocal energy indicating enthusiastic speech."
+        energy_interp = f"Voice energy is {energy_value}, indicating enthusiastic speech."
 
     # -----------------------------
     # Pitch Variation
@@ -271,12 +276,13 @@ def analyze_audio_signal(audio_path):
     else:
         pitch_std = float(np.std(pitch_values))
 
+    pitch_value = round(pitch_std, 2)
     if pitch_std < 20:
-        pitch_interp = "Very little pitch variation; speech may sound monotone."
+        pitch_interp = f"Pitch variation is {pitch_value}, so speech may sound monotone."
     elif pitch_std < 50:
-        pitch_interp = "Moderate pitch variation indicating natural speech."
+        pitch_interp = f"Pitch variation is {pitch_value}, indicating natural speech."
     else:
-        pitch_interp = "High pitch variation indicating expressive speech."
+        pitch_interp = f"Pitch variation is {pitch_value}, indicating expressive speech."
 
     # -----------------------------
     # Silence Detection
@@ -287,20 +293,21 @@ def analyze_audio_signal(audio_path):
 
     total_duration = len(y)
 
-    silence_ratio = 1 - (speech_duration / total_duration)
+    silence_ratio = 1 - (speech_duration / total_duration) if total_duration else 1
+    silence_pct = round(float(silence_ratio) * 100, 1)
 
     if silence_ratio < 0.15:
-        silence_interp = "Speech flow is smooth with minimal pauses."
+        silence_interp = f"Silence ratio is {silence_pct}%, so speech flow is smooth with minimal pauses."
     elif silence_ratio < 0.30:
-        silence_interp = "Moderate pauses detected in speech."
+        silence_interp = f"Silence ratio is {silence_pct}%, indicating moderate pauses."
     else:
-        silence_interp = "Frequent pauses detected indicating hesitation."
+        silence_interp = f"Silence ratio is {silence_pct}%, indicating frequent pauses or hesitation."
 
     return {
-        "voice_energy": round(avg_energy,4),      
+        "voice_energy": energy_value,      
         "energy_interpretation": energy_interp,
 
-        "pitch_variation": round(pitch_std,2),
+        "pitch_variation": pitch_value,
         "pitch_interpretation": pitch_interp,
 
         "silence_ratio": round(float(silence_ratio),3),
@@ -479,7 +486,7 @@ def process_audio(video_path, prefix, sarvam_key):
         "detected_languages": detected_languages,
         "audio_metrics": audio_metrics,
         "audio_signal_analysis": audio_signal_metrics,
-
+        "speech_detected": bool(full_transcript and full_transcript.strip()),
         "timing": {
             "audio_extraction_time_sec": extract_time,
             "transcription_time_sec": transcription_time,

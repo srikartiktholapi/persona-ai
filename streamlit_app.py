@@ -792,6 +792,91 @@ def render_step_card(step_label: str, title: str):
   )
 
 
+def _as_float(value, default=None):
+  try:
+    return float(value)
+  except (TypeError, ValueError):
+    return default
+
+
+def build_audio_interpretation_lines(audio_metrics: dict, audio_signal: dict) -> list[str]:
+  """Render audio coaching text from the current metric values."""
+  lines = []
+
+  wpm = _as_float(audio_metrics.get("wpm"))
+  if wpm is not None:
+    if wpm < 100:
+      msg = f"Measured pace is {wpm:g} WPM, which is slow and may sound hesitant."
+    elif wpm < 130:
+      msg = f"Measured pace is {wpm:g} WPM, slightly slow but understandable."
+    elif wpm <= 170:
+      msg = f"Measured pace is {wpm:g} WPM, ideal for professional communication."
+    elif wpm <= 190:
+      msg = f"Measured pace is {wpm:g} WPM, slightly fast but still understandable."
+    else:
+      msg = f"Measured pace is {wpm:g} WPM, too fast and may affect clarity."
+    lines.append(f"**WPM:** {msg}")
+
+  filler_score = _as_float(audio_metrics.get("filler_score"))
+  if filler_score is not None:
+    filler_count = audio_metrics.get("filler_count")
+    filler_pct = round(filler_score * 100, 1)
+    count_text = f"{filler_count} filler pattern(s), " if filler_count is not None else ""
+    if filler_score < 0.02:
+      msg = f"Detected {count_text}{filler_pct}% of words, showing minimal hesitation."
+    elif filler_score < 0.05:
+      msg = f"Detected {count_text}{filler_pct}% of words, so hesitation is present but acceptable."
+    elif filler_score < 0.1:
+      msg = f"Detected {count_text}{filler_pct}% of words, which noticeably affects fluency."
+    else:
+      msg = f"Detected {count_text}{filler_pct}% of words, indicating high hesitation."
+    lines.append(f"**Filler:** {msg}")
+
+  pause_rate = _as_float(audio_metrics.get("pause_rate"))
+  if pause_rate is not None:
+    pause_pct = round(pause_rate * 100, 1)
+    if pause_rate < 0.15:
+      msg = f"Pause rate is {pause_pct}%, indicating smooth speech with minimal pauses."
+    elif pause_rate < 0.3:
+      msg = f"Pause rate is {pause_pct}%, so moderate pauses were observed."
+    else:
+      msg = f"Pause rate is {pause_pct}%, indicating frequent pauses and possible hesitation."
+    lines.append(f"**Pause:** {msg}")
+
+  energy = _as_float(audio_signal.get("voice_energy"))
+  if energy is not None:
+    if energy < 0.02:
+      msg = f"Voice energy is {energy:.4f}, which is low and may sound weak or monotone."
+    elif energy < 0.05:
+      msg = f"Voice energy is {energy:.4f}, suggesting steady speech delivery."
+    else:
+      msg = f"Voice energy is {energy:.4f}, indicating enthusiastic speech."
+    lines.append(f"**Energy:** {msg}")
+
+  pitch = _as_float(audio_signal.get("pitch_variation"))
+  if pitch is not None:
+    if pitch < 20:
+      msg = f"Pitch variation is {pitch:g}, so speech may sound monotone."
+    elif pitch < 50:
+      msg = f"Pitch variation is {pitch:g}, indicating natural speech."
+    else:
+      msg = f"Pitch variation is {pitch:g}, indicating expressive speech."
+    lines.append(f"**Pitch:** {msg}")
+
+  silence = _as_float(audio_signal.get("silence_ratio"))
+  if silence is not None:
+    silence_pct = round(silence * 100, 1)
+    if silence < 0.15:
+      msg = f"Silence ratio is {silence_pct}%, so speech flow is smooth with minimal pauses."
+    elif silence < 0.30:
+      msg = f"Silence ratio is {silence_pct}%, indicating moderate pauses."
+    else:
+      msg = f"Silence ratio is {silence_pct}%, indicating frequent pauses or hesitation."
+    lines.append(f"**Silence:** {msg}")
+
+  return lines
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 0 — Persona / Activity / Task
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1172,7 +1257,7 @@ if "results" in st.session_state:
         sm4.metric("Silence Ratio", audio_signal.get("silence_ratio","—"))
 
         # Interpretation details always shown (no expander)
-        interp_lines = []
+        interp_lines = build_audio_interpretation_lines(audio_metrics, audio_signal)
         for k, l in [("wpm_interpretation","WPM"), ("filler_interpretation","Filler"), ("pause_interpretation","Pause")]:
             v = audio_metrics.get(k,"")
             if v and v != "—":
@@ -1181,25 +1266,28 @@ if "results" in st.session_state:
             v = audio_signal.get(k,"")
             if v and v != "—":
                 interp_lines.append(f"**{l}:** {v}")
+        interp_lines = interp_lines[:6]
         if interp_lines:
             with st.expander("Interpretation Details", expanded=True):
                 for line in interp_lines:
                     st.markdown(f"- {line}")
 
         if audio_llm:
-            st.markdown("#### LLM Feedback")
-            for key, label in [
-                ("tone_quality",          "Tone"),
-                ("voice_quality_feedback","Voice"),
-                ("engagement_level",      "Engagement"),
-                ("communication_style",   "Style"),
-                ("language_fluency",      "Fluency"),
-                ("professionalism_level", "Professionalism"),
-                ("filler_word_usage",     "Fillers"),
-            ]:
-                v = audio_llm.get(key,"")
-                if v:
-                    st.markdown(f"**{label}:** {v}")
+          st.markdown("#### LLM Feedback")
+          for key, label in [
+            ("tone_quality",          "Tone"),
+            ("voice_quality_feedback","Voice"),
+            ("engagement_level",      "Engagement"),
+            ("communication_style",   "Style"),
+            ("language_fluency",      "Fluency"),
+            ("professionalism_level", "Professionalism"),
+            ("filler_word_usage",     "Fillers"),
+          ]:
+            v = audio_llm.get(key,"")
+            if v:
+              st.markdown(f"**{label}:** {v}")
+        else:
+          st.info("No spoken content detected; audio LLM feedback is unavailable.")
 
     # ── Text & Relevance ──────────────────────────────────────────────────────
     with tab_txt:
@@ -1214,8 +1302,14 @@ if "results" in st.session_state:
         tm2.metric("Filler Words",   text_result.get("filler_count","—"))
 
         if (fb := text_result.get("feedback","")):
-            t_sc = scores.get("text_performance_score",5)
-            (st.success if t_sc>=8 else st.info if t_sc>=6 else st.warning)(f"**Evaluator:** {fb}")
+          t_sc = scores.get("text_performance_score", 5)
+          if t_sc is None:
+            t_sc = 5
+          try:
+            t_sc = float(t_sc)
+          except (TypeError, ValueError):
+            t_sc = 5
+          (st.success if t_sc>=8 else st.info if t_sc>=6 else st.warning)(f"**Evaluator:** {fb}")
 
         det_langs = text_result.get("detected_languages") or results.get("detected_languages", [])
         if det_langs and det_langs != ["unknown"]:
@@ -1248,9 +1342,15 @@ if "results" in st.session_state:
         with st.expander("Prompt evaluated against", expanded=False):
             st.info(enh_prompt)
 
-        r_sc = scores.get("relevance_score",0)
+        r_sc = scores.get("relevance_score", 5)
+        if r_sc is None:
+          r_sc = 5
+        try:
+          r_sc = float(r_sc)
+        except (TypeError, ValueError):
+          r_sc = 5
         if rel_reason:
-            (st.success if r_sc>=8 else st.info if r_sc>=5 else st.warning)(f"**Evaluator:** {rel_reason}")
+          (st.success if r_sc>=8 else st.info if r_sc>=5 else st.warning)(f"**Evaluator:** {rel_reason}")
 
         # Deductions always visible (expanded) when score is low
         if rel_deducts:
@@ -1287,3 +1387,5 @@ if "results" in st.session_state:
             tips.append("**Use PREP:** Point → Reason → Example → Point (restate).")
             for tip in tips:
                 st.markdown(f"- {tip}")
+
+                  

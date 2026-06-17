@@ -6,10 +6,16 @@ from app.core.config import settings
 def process(state: AgentState) -> dict:
     """Weighted overall score + trend memory"""
     scores = state.get("scores", {})
-    vid_score = scores.get("visual_performance_score", 0.0)
-    aud_score = scores.get("audio_performance_score", 0.0)
-    text_score = scores.get("text_performance_score", 0.0)
-    rel_score = scores.get("relevance_score", 0.0)
+    vid_score = scores.get("visual_performance_score")
+    aud_score = scores.get("audio_performance_score")
+    text_score = scores.get("text_performance_score")
+    rel_score = scores.get("relevance_score")
+    
+    # Handle None values: missing from processing errors defaults to 5.0, missing from unavailable data defaults to 0.0
+    vid_score = 5.0 if vid_score is None else float(vid_score)
+    aud_score = 5.0 if aud_score is None else float(aud_score)
+    text_score = 5.0 if text_score is None else float(text_score)
+    rel_score = 5.0 if rel_score is None else float(rel_score)
     
     # 20% video, 30% audio, 50% text & relevance (30% relevance, 20% text)
     overall = (vid_score * 0.20) + (aud_score * 0.30) + (text_score * 0.20) + (rel_score * 0.30)

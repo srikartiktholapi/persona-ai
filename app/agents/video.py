@@ -268,6 +268,15 @@ def _create_tasks_landmarkers():
     )
 
 
+def should_generate_visual_summary(video_metrics):
+    """Return True only when visual analysis has usable face landmarks."""
+    if not isinstance(video_metrics, dict):
+        return False
+    return bool(video_metrics.get("video_analysis_available")) and bool(
+        video_metrics.get("face_landmarks_detected", False)
+    )
+
+
 def analyze_video_with_mediapipe_tasks(video_path):
     posture_vals = []
     expr_vals = []
@@ -304,6 +313,7 @@ def analyze_video_with_mediapipe_tasks(video_path):
     prev_nose_x = None
     sampled_frames = 0
     landmark_frames = 0
+    face_frames_detected = 0
 
     try:
         frame_count = 0
@@ -336,12 +346,10 @@ def analyze_video_with_mediapipe_tasks(video_path):
 
             if face_result.face_landmarks:
                 landmark_frames += 1
+                face_frames_detected += 1
                 face = face_result.face_landmarks[0]
                 expr_vals.append(calculate_expression_score(face))
                 eye_vals.append(calculate_eye_contact(face))
-            else:
-                expr_vals.append(5.0)
-                eye_vals.append(5.0)
     finally:
         cap.release()
         pose_landmarker.close()
@@ -351,12 +359,25 @@ def analyze_video_with_mediapipe_tasks(video_path):
         return {
             "video_analysis_available": False,
             "video_analysis_status": f"MediaPipe detected no face or body landmarks in {sampled_frames} sampled frames.",
+            "face_landmarks_detected": False,
             "posture_score": None,
             "eye_contact_score": None,
             "expression_score": None,
             "head_stability": None,
             "body_language_score": None,
         }
+
+    posture_mean = pd.Series(posture_vals).mean() if posture_vals else 5.0
+    expr_mean = pd.Series(expr_vals).mean() if expr_vals else 5.0
+    eye_mean = pd.Series(eye_vals).mean() if eye_vals else 5.0
+    head_mean = pd.Series(head_movement_vals).mean() if head_movement_vals else 5.0
+
+    if face_frames_detected == 0:
+        video_status = (
+            "Face landmarks were not detected in the recording, but posture and head stability analysis were completed."
+        )
+    else:
+        video_status = "Visual analysis completed using MediaPipe Tasks."
 
     posture_mean = pd.Series(posture_vals).mean() if posture_vals else 5.0
     expr_mean = pd.Series(expr_vals).mean() if expr_vals else 5.0
@@ -373,6 +394,7 @@ def analyze_video_with_mediapipe_tasks(video_path):
 
     return {
         "video_analysis_available": True,
+        "face_landmarks_detected": True,
         "video_analysis_status": "Visual analysis completed using MediaPipe Tasks.",
         "video_analysis_method": "mediapipe_tasks",
         "sampled_frames": sampled_frames,
@@ -545,6 +567,7 @@ def analyze_video(video_path):
 
     prev_nose_x = None
     landmark_frames = 0
+    face_frames_detected = 0
 
     with mp_holistic.Holistic(
         min_detection_confidence=0.5,
@@ -594,6 +617,7 @@ def analyze_video(video_path):
 
             if results.face_landmarks:
                 landmark_frames += 1
+                face_frames_detected += 1
 
                 expr_vals.append(
                     calculate_expression_score(
@@ -607,16 +631,12 @@ def analyze_video(video_path):
                     )
                 )
 
-            else:
-
-                expr_vals.append(5)
-                eye_vals.append(5)
-
     cap.release()
 
     if landmark_frames == 0:
         return {
             "video_analysis_available": False,
+            "face_landmarks_detected": False,
             "video_analysis_status": "No face or body landmarks were detected in the recording.",
             "posture_score": None,
             "eye_contact_score": None,
@@ -644,7 +664,11 @@ def analyze_video(video_path):
 
     return {
         "video_analysis_available": True,
-        "video_analysis_status": "Visual analysis completed.",
+        "face_landmarks_detected": face_frames_detected > 0,
+        "video_analysis_status": (
+            "Visual analysis completed, but no face landmarks were detected; posture and head stability analysis are available."
+            if face_frames_detected == 0 else "Visual analysis completed."
+        ),
         "posture_score": round(posture_mean, 2),
         "eye_contact_score": round(eye_mean, 2),
         "expression_score": round(expr_mean, 2),
@@ -668,3 +692,5 @@ def download_video(video_url: str, save_dir="uploads"):
                 if chunk:
                     f.write(chunk)
 '''
+
+
