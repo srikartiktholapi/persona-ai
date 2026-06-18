@@ -23,3 +23,4 @@ numpy
 streamlit
 streamlit-webrtc
 av
+psycopg2-binary

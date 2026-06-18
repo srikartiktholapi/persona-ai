@@ -1387,5 +1387,3 @@ if "results" in st.session_state:
             tips.append("**Use PREP:** Point → Reason → Example → Point (restate).")
             for tip in tips:
                 st.markdown(f"- {tip}")
-
-                  
